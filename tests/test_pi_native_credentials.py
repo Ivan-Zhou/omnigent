@@ -1102,3 +1102,40 @@ def test_databricks_env_empty_without_databricks_provider() -> None:
         }
     }
     assert creds.pi_native_databricks_env(config_loader=lambda: config) == {}
+
+
+def test_self_provisioned_true_when_configured() -> None:
+    """``pi_native.self_provisioned: true`` → the wrapper owns provisioning."""
+    config = {"pi_native": {"self_provisioned": True}}
+    assert creds.pi_native_self_provisioned(config_loader=lambda: config) is True
+
+
+def test_self_provisioned_defaults_false() -> None:
+    """Absent ``pi_native`` block or key → False (vanilla Pi needs omnigent's provider)."""
+    assert creds.pi_native_self_provisioned(config_loader=dict) is False
+    assert creds.pi_native_self_provisioned(config_loader=lambda: {"pi_native": {}}) is False
+
+
+def test_self_provisioned_false_on_malformed_block() -> None:
+    """A non-mapping ``pi_native`` value is ignored, not fatal."""
+    assert creds.pi_native_self_provisioned(config_loader=lambda: {"pi_native": "nope"}) is False
+
+
+def test_databricks_env_prefers_configured_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``pi_native.databricks_profile`` wins over the default provider's profile.
+
+    A BYOP wrapper can point at a different workspace than omnigent's own
+    provider — e.g. one hosting a model the default workspace lacks.
+    """
+    config = {
+        "pi_native": {"self_provisioned": True, "databricks_profile": "alt-workspace"},
+        "providers": {
+            "databricks": {"kind": "databricks", "default": True, "profile": "default-workspace"},
+        },
+    }
+    seen = _patch_workspace(monkeypatch, host="https://alt.example.com", token="tok")
+
+    env = creds.pi_native_databricks_env(config_loader=lambda: config)
+
+    assert env["DATABRICKS_HOST"] == "https://alt.example.com"
+    assert seen == ["alt-workspace"]  # configured profile, not "default-workspace"

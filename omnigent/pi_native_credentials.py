@@ -908,6 +908,45 @@ def resolve_pi_native_provider(
         return None
 
 
+def _pi_native_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the ``pi_native:`` block of *config*, or ``{}`` when absent.
+
+    ``pi_native`` is an optional top-level mapping in ``~/.omnigent/config.yaml``
+    that tunes the pi-native harness for a bring-your-own-provider (BYOP) ``pi``
+    wrapper::
+
+        pi_native:
+          self_provisioned: true         # wrapper owns provider/model; don't inject
+          databricks_profile: my-workspace  # profile whose host+token it needs
+    """
+    block = config.get("pi_native")
+    return block if isinstance(block, dict) else {}
+
+
+def pi_native_self_provisioned(
+    *,
+    config_loader: Callable[[], dict[str, Any]] = load_config,
+) -> bool:
+    """Whether the configured ``pi`` binary provisions its own provider/model.
+
+    When ``pi_native.self_provisioned`` is true the ``pi`` on PATH is a wrapper
+    that already pins its own ``--provider`` / ``--model`` and registers its
+    provider (e.g. via an auto-loaded extension). The harness must then NOT
+    inject omnigent's ``--provider`` / ``--model`` (Pi is last-wins on
+    ``--model``, so injecting would override the wrapper's pinned model) nor a
+    managed ``models.json``. Defaults to ``False`` — vanilla upstream Pi has no
+    provider of its own, so omnigent supplies one as before.
+
+    :param config_loader: Injection seam for tests; defaults to
+        :func:`load_config`.
+    :returns: ``True`` when the wrapper owns provisioning, else ``False``.
+    """
+    try:
+        return bool(_pi_native_config(config_loader()).get("self_provisioned", False))
+    except Exception:  # noqa: BLE001 — config failure must not break launch
+        return False
+
+
 def pi_native_databricks_env(
     *,
     config_loader: Callable[[], dict[str, Any]] = load_config,
@@ -923,10 +962,15 @@ def pi_native_databricks_env(
     ignores these vars, so injecting them is harmless there and unblocks such a
     wrapper.
 
-    The workspace is the ``kind="databricks"`` provider omnigent already uses:
-    the default provider when it is Databricks-kind, else the first
-    Databricks-kind provider configured (mirroring
-    :func:`resolve_pi_native_provider`'s fallback).
+    Profile precedence:
+
+    1. ``pi_native.databricks_profile`` when set — lets a BYOP wrapper target a
+       different workspace than omnigent's own provider (e.g. a PAT-only
+       workspace hosting a model absent from the default one).
+    2. Otherwise the ``kind="databricks"`` provider omnigent already uses: the
+       default provider when it is Databricks-kind, else the first
+       Databricks-kind provider configured (mirroring
+       :func:`resolve_pi_native_provider`'s fallback).
 
     Best-effort: returns ``{}`` on any failure so it can never block the
     terminal launch.
@@ -938,20 +982,22 @@ def pi_native_databricks_env(
     """
     try:
         config = config_loader()
-        profile: str | None = None
-        entry = default_provider_for_harness(config, PI_SURFACE)
-        if entry is not None and entry.kind == DATABRICKS_KIND:
-            profile = entry.profile
-        else:
-            # A non-databricks default (e.g. a cli-config gateway) can still sit
-            # alongside a databricks-kind provider carrying the workspace creds.
-            providers = config.get("providers") or {}
-            if isinstance(providers, dict):
-                for raw in providers.values():
-                    if isinstance(raw, dict) and raw.get("kind") == DATABRICKS_KIND:
-                        got = raw.get("profile")
-                        profile = got if isinstance(got, str) else None
-                        break
+        configured = _pi_native_config(config).get("databricks_profile")
+        profile: str | None = configured if isinstance(configured, str) else None
+        if profile is None:
+            entry = default_provider_for_harness(config, PI_SURFACE)
+            if entry is not None and entry.kind == DATABRICKS_KIND:
+                profile = entry.profile
+            else:
+                # A non-databricks default (e.g. a cli-config gateway) can still
+                # sit alongside a databricks-kind provider carrying the creds.
+                providers = config.get("providers") or {}
+                if isinstance(providers, dict):
+                    for raw in providers.values():
+                        if isinstance(raw, dict) and raw.get("kind") == DATABRICKS_KIND:
+                            got = raw.get("profile")
+                            profile = got if isinstance(got, str) else None
+                            break
 
         from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 

@@ -1845,10 +1845,17 @@ async def _auto_create_pi_terminal(
     # ``omnigent setup`` (Databricks gateway / API key), so a separate
     # ``pi /login`` isn't required — the parity codex-native/claude-native
     # already have. Skipped when the user pinned their own provider/model via
-    # terminal_launch_args, or when no usable provider is configured (Pi then
-    # falls back to its own login). Writes a managed per-session Pi config dir,
-    # never touching the user's global ``~/.pi/agent``.
-    if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
+    # terminal_launch_args, when the configured ``pi`` is a self-provisioning
+    # wrapper (``pi_native.self_provisioned`` — it pins its own provider/model,
+    # and injecting ours would override its model since Pi is last-wins), or
+    # when no usable provider is configured (Pi then falls back to its own
+    # login). Writes a managed per-session Pi config dir, never touching the
+    # user's global ``~/.pi/agent``.
+    from omnigent.pi_native_credentials import pi_native_self_provisioned
+
+    if not pi_native_self_provisioned() and not _pi_args_have_provider(
+        launch_config.terminal_launch_args or []
+    ):
         from omnigent.pi_native_credentials import (
             pi_native_provider_launch,
             resolve_pi_native_provider,
