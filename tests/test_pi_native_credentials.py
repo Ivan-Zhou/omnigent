@@ -1023,3 +1023,82 @@ def test_fetch_pi_model_lists_falls_back_on_http_error() -> None:
     assert claude == []
     assert gpt == []
     assert completions == []
+
+
+def _patch_workspace(
+    monkeypatch: pytest.MonkeyPatch, *, host: str, token: str
+) -> list[str | None]:
+    """Stub ``resolve_databricks_workspace``; return a list capturing the profile it saw.
+
+    ``pi_native_databricks_env`` imports the resolver lazily from
+    ``omnigent.runtime.credentials.databricks``, so patching the attribute on
+    that source module is what the call binds to.
+    """
+    from omnigent.runtime.credentials import databricks as db_creds_mod
+
+    seen: list[str | None] = []
+
+    def _fake(profile: str | None) -> object:
+        seen.append(profile)
+        return db_creds_mod.WorkspaceCreds(host=host, token=token)
+
+    monkeypatch.setattr(db_creds_mod, "resolve_databricks_workspace", _fake)
+    return seen
+
+
+def test_databricks_env_resolves_from_default_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Databricks-kind default provider → its profile's host+token are injected."""
+    seen = _patch_workspace(monkeypatch, host="https://wkspc.example.com", token="tok")
+
+    env = creds.pi_native_databricks_env(config_loader=_databricks_config)
+
+    assert env == {
+        "DATABRICKS_HOST": "https://wkspc.example.com",
+        "DATABRICKS_TOKEN": "tok",
+    }
+    assert seen == ["demo-staging"]
+
+
+def test_databricks_env_falls_back_to_non_default_databricks_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-Databricks default still injects creds from a sibling Databricks provider.
+
+    The default here is a subscription (Claude) provider Pi cannot borrow creds
+    from, but a ``kind="databricks"`` provider alongside it carries the
+    workspace host+token the wrapper needs.
+    """
+    config = {
+        "providers": {
+            "claude": {"kind": "subscription", "default": True, "cli": "claude"},
+            "databricks": {"kind": "databricks", "profile": "sibling-workspace"},
+        }
+    }
+    seen = _patch_workspace(monkeypatch, host="https://wkspc.example.com", token="tok")
+
+    env = creds.pi_native_databricks_env(config_loader=lambda: config)
+
+    assert env["DATABRICKS_HOST"] == "https://wkspc.example.com"
+    assert env["DATABRICKS_TOKEN"] == "tok"
+    assert seen == ["sibling-workspace"]
+
+
+def test_databricks_env_empty_when_creds_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Blank host/token (profile not resolvable) → empty mapping, not a partial env."""
+    _patch_workspace(monkeypatch, host="", token="")
+
+    assert creds.pi_native_databricks_env(config_loader=_databricks_config) == {}
+
+
+def test_databricks_env_empty_without_databricks_provider() -> None:
+    """No Databricks-kind provider anywhere → empty mapping (nothing to inject)."""
+    config = {
+        "providers": {
+            "anthropic": {
+                "kind": "key",
+                "default": True,
+                "anthropic": {"base_url": "https://api.anthropic.com", "api_key": "sk-x"},
+            }
+        }
+    }
+    assert creds.pi_native_databricks_env(config_loader=lambda: config) == {}

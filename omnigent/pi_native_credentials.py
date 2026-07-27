@@ -908,6 +908,66 @@ def resolve_pi_native_provider(
         return None
 
 
+def pi_native_databricks_env(
+    *,
+    config_loader: Callable[[], dict[str, Any]] = load_config,
+) -> dict[str, str]:
+    """Resolve ``DATABRICKS_HOST`` / ``DATABRICKS_TOKEN`` for the Pi terminal.
+
+    Some ``pi`` builds (e.g. a workspace wrapper that auto-loads a Databricks
+    extension) hard-require ``DATABRICKS_HOST`` and ``DATABRICKS_TOKEN`` in the
+    environment at startup and abort before the RPC loop otherwise. The runner
+    has already returned ``200`` on the harness event stream by then, so the
+    abort surfaces to the UI as a mid-stream ``ReadError`` ("Harness stream
+    connection error") rather than a clear startup failure. Vanilla upstream Pi
+    ignores these vars, so injecting them is harmless there and unblocks such a
+    wrapper.
+
+    The workspace is the ``kind="databricks"`` provider omnigent already uses:
+    the default provider when it is Databricks-kind, else the first
+    Databricks-kind provider configured (mirroring
+    :func:`resolve_pi_native_provider`'s fallback).
+
+    Best-effort: returns ``{}`` on any failure so it can never block the
+    terminal launch.
+
+    :param config_loader: Injection seam for tests; defaults to
+        :func:`load_config`.
+    :returns: ``{"DATABRICKS_HOST": ..., "DATABRICKS_TOKEN": ...}`` when the
+        profile resolves, else an empty mapping.
+    """
+    try:
+        config = config_loader()
+        profile: str | None = None
+        entry = default_provider_for_harness(config, PI_SURFACE)
+        if entry is not None and entry.kind == DATABRICKS_KIND:
+            profile = entry.profile
+        else:
+            # A non-databricks default (e.g. a cli-config gateway) can still sit
+            # alongside a databricks-kind provider carrying the workspace creds.
+            providers = config.get("providers") or {}
+            if isinstance(providers, dict):
+                for raw in providers.values():
+                    if isinstance(raw, dict) and raw.get("kind") == DATABRICKS_KIND:
+                        got = raw.get("profile")
+                        profile = got if isinstance(got, str) else None
+                        break
+
+        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+        creds = resolve_databricks_workspace(profile)
+        if not creds.host or not creds.token:
+            return {}
+        return {"DATABRICKS_HOST": creds.host, "DATABRICKS_TOKEN": creds.token}
+    except Exception:  # noqa: BLE001 — credential resolution must not break launch
+        _LOGGER.info(
+            "pi-native: could not resolve DATABRICKS_HOST/TOKEN for the Pi terminal; "
+            "launching without them (fine for upstream Pi).",
+            exc_info=True,
+        )
+        return {}
+
+
 def write_pi_models_config(agent_dir: Path, provider: PiProviderConfig) -> Path:
     """Write *provider* as ``models.json`` into a managed Pi config dir.
 

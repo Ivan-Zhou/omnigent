@@ -1867,6 +1867,17 @@ async def _auto_create_pi_terminal(
             cred_env, cred_args = pi_native_provider_launch(bridge_dir / "pi-agent", provider)
             pi_env.update(cred_env)
             pi_args.extend(cred_args)
+    # Some ``pi`` builds (a workspace wrapper that auto-loads a Databricks
+    # extension) hard-require DATABRICKS_HOST/DATABRICKS_TOKEN in the environment
+    # at startup and abort before the RPC loop otherwise — the runner then
+    # surfaces the mid-stream ReadError as "Harness stream connection error".
+    # The wrapper loads its extension on every launch regardless of provider
+    # args, so inject the creds unconditionally, resolved from the same profile
+    # the pi-native provider uses. Vanilla upstream Pi ignores these vars, so
+    # this is harmless there. Best-effort: returns {} on any failure.
+    from omnigent.pi_native_credentials import pi_native_databricks_env
+
+    pi_env.update(pi_native_databricks_env())
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
