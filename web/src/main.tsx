@@ -21,7 +21,6 @@ import {
   readUiFontFamily,
   readUiFontSizePx,
 } from "./lib/uiFontPreferences";
-import { applySidebarFontSize, readSidebarFontSizePx } from "./lib/sidebarFontPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
 import { initChatStore } from "./store/chatStore";
@@ -61,7 +60,16 @@ initNativeInsets();
 // Apply the saved UI font size and family before first paint so there's no flash.
 applyUiFontScale(readUiFontSizePx());
 applyUiFontFamily(readUiFontFamily());
-applySidebarFontSize(readSidebarFontSizePx());
+
+// The sidebar font size control was removed. Clear any previously persisted
+// value so existing users fall back to the default 13px size on reload.
+if (typeof window !== "undefined") {
+  try {
+    localStorage.removeItem("omnigent:sidebar-font-size");
+  } catch {
+    // localStorage access errors are non-fatal.
+  }
+}
 
 // Apply the saved color palette (data-theme on <html>) before first paint too,
 // so the app renders in the chosen theme rather than flashing the brand default.
@@ -74,9 +82,9 @@ applyThemePalette(readThemePalette());
 // missing server doesn't deadlock first paint. We add a small
 // safety timeout (1.5s) so users on a flaky network still get
 // something on screen.
-const _bootProbe: Promise<ServerInfo> = Promise.race([
+const bootProbe: Promise<ServerInfo> = Promise.race([
   resolveServerInfo(),
-  new Promise<ServerInfo>((resolve) =>
+  new Promise<ServerInfo>((resolve) => {
     setTimeout(
       () =>
         resolve({
@@ -96,11 +104,11 @@ const _bootProbe: Promise<ServerInfo> = Promise.race([
           dictation_available: false,
         }),
       1500,
-    ),
-  ),
+    );
+  }),
 ]);
 
-void _bootProbe.then((info) => {
+void bootProbe.then((info) => {
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
       <CapabilitiesProvider info={info}>

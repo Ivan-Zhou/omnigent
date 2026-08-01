@@ -28,6 +28,7 @@ import {
   type ConversationsInfiniteData,
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
+import { setLegacyPinnedConversationId } from "@/shell/sidebarNav";
 import { stopSession } from "@/lib/sessionsApi";
 import {
   createProject as apiCreateProject,
@@ -62,6 +63,23 @@ export interface UseConversationsOptions {
   reconcileWhileConnected?: boolean;
 }
 
+export class BulkConversationMutationError extends Error {
+  readonly failed: string[];
+  readonly succeeded: string[];
+  readonly total: number;
+
+  constructor(
+    action: string,
+    { failed, succeeded = [], total }: { failed: string[]; succeeded?: string[]; total: number },
+  ) {
+    super(`Failed to ${action} ${failed.length} of ${total} conversations`);
+    this.name = "BulkConversationMutationError";
+    this.failed = failed;
+    this.succeeded = succeeded;
+    this.total = total;
+  }
+}
+
 /** Mirrors the server's `SessionListItem` / `ConversationObject` shape. */
 export interface Conversation {
   id: string;
@@ -71,6 +89,8 @@ export interface Conversation {
   updated_at: number;
   labels: Record<string, string>;
   permission_level: number | null;
+  /** Whether this viewer may accept privileged actions for the session. */
+  can_approve?: boolean | null;
   owner?: string | null;
   runner_id?: string | null;
   /** Host that launched the runner for this session, e.g. ``"host_a1b2"``. */
@@ -199,6 +219,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     updated_at: wire.updated_at ?? wire.created_at,
     labels: wire.labels ?? {},
     permission_level: wire.permission_level ?? null,
+    can_approve: wire.can_approve ?? null,
     owner: wire.owner ?? null,
     runner_id: wire.runner_id ?? null,
     host_id: wire.host_id ?? null,
@@ -267,8 +288,8 @@ async function fetchConversationsPage({
  * the Archived settings view's project filter.
  */
 export function useConversations(
-  searchQuery: string = "",
-  includeArchived: boolean = false,
+  searchQuery = "",
+  includeArchived = false,
   options: UseConversationsOptions = {},
   project?: string,
 ) {
@@ -583,6 +604,13 @@ export function useStopAndDeleteConversation() {
       }
       queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
       queryClient.removeQueries({ queryKey: ["session", id] });
+      // The Pinned section reads a separate, sibling cache that the
+      // ["conversations"] sweep above deliberately skips, so a deleted pinned
+      // row lingers there until a reload unless we drop it explicitly. Patched
+      // (not invalidated) for the same reindex-lag reason as the list.
+      queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+        old ? { ...old, conversations: old.conversations.filter((c) => !ids.has(c.id)) } : old,
+      );
       // Deleting the last member of a project empties it, so refresh the
       // project list to drop the now-empty folder. Unlike the conversations
       // list, /v1/sessions/projects reads the DB directly (no search-index
@@ -641,7 +669,9 @@ export function useBulkArchiveConversations() {
             (results[i] as PromiseFulfilledResult<Conversation>).value.updated_at,
           );
       }
-      if (failed.length > 0) throw { failed, total: ids.length };
+      if (failed.length > 0) {
+        throw new BulkConversationMutationError("archive", { failed, total: ids.length });
+      }
       return results
         .filter((r): r is PromiseFulfilledResult<Conversation> => r.status === "fulfilled")
         .map((r) => r.value);
@@ -682,7 +712,13 @@ export function useBulkDeleteConversations() {
         if (results[i].status === "fulfilled") succeeded.push(ids[i]);
         else failed.push(ids[i]);
       }
-      if (failed.length > 0) throw { failed, succeeded, total: ids.length };
+      if (failed.length > 0) {
+        throw new BulkConversationMutationError("delete", {
+          failed,
+          succeeded,
+          total: ids.length,
+        });
+      }
       return { succeeded, failed };
     },
     onSuccess: (_data, ids) => {
@@ -702,14 +738,18 @@ export function useBulkDeleteConversations() {
         queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
         queryClient.removeQueries({ queryKey: ["session", id] });
       }
+      // Drop deleted rows from the sibling Pinned cache the sweep above skips.
+      queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+        old ? { ...old, conversations: old.conversations.filter((c) => !idSet.has(c.id)) } : old,
+      );
       // Refresh the project list so a project emptied by these deletes drops
       // its now-empty folder (DB-direct read, no search-index lag).
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
     },
-    onError: (err: any) => {
-      if (err?.succeeded) {
-        const idSet = new Set(err.succeeded as string[]);
+    onError: (error) => {
+      if (error instanceof BulkConversationMutationError && error.succeeded.length > 0) {
+        const idSet = new Set(error.succeeded);
         for (const queryKey of [["conversations"], ["project-sessions"]]) {
           for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
             queryKey,
@@ -718,10 +758,14 @@ export function useBulkDeleteConversations() {
             if (removed) queryClient.setQueryData(key, next);
           }
         }
-        for (const id of err.succeeded) {
+        for (const id of error.succeeded) {
           queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
           queryClient.removeQueries({ queryKey: ["session", id] });
         }
+        // Drop the successfully-deleted rows from the sibling Pinned cache too.
+        queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+          old ? { ...old, conversations: old.conversations.filter((c) => !idSet.has(c.id)) } : old,
+        );
         void queryClient.invalidateQueries({ queryKey: ["projects"] });
         void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
       }
@@ -746,7 +790,13 @@ export function useBulkStopSessions() {
         if (results[i].status === "fulfilled") succeeded.push(ids[i]);
         else failed.push(ids[i]);
       }
-      if (failed.length > 0) throw { failed, succeeded, total: ids.length };
+      if (failed.length > 0) {
+        throw new BulkConversationMutationError("stop", {
+          failed,
+          succeeded,
+          total: ids.length,
+        });
+      }
       return { succeeded, failed };
     },
     onSettled: () => {
@@ -772,14 +822,39 @@ export { PINNED_LABEL_KEY };
 export const PINNED_CONVERSATIONS_KEY = ["pinned-conversations"] as const;
 
 /**
+ * Result of the pinned-session query. `conversations` is the viewer's pinned
+ * sessions; `filterHonored` says whether the server actually applied the
+ * `?pinned=true` filter (see {@link fetchPinnedConversations}).
+ */
+export interface PinnedConversationsResult {
+  conversations: Conversation[];
+  /**
+   * False when the server ignored the `pinned` query param — i.e. a
+   * pre-upgrade server that predates server-side pins. Such a server returns
+   * an ordinary (unfiltered) session page whose rows carry no `omnigent.pinned`
+   * label. The sidebar reads this to keep the one-time localStorage→server pin
+   * migration inert until the server can actually store pins, so a
+   * UI-before-server upgrade can't wipe local pins.
+   */
+  filterHonored: boolean;
+}
+
+/**
  * Fetch every pinned session (the `omnigent.pinned` label) via
  * `GET /v1/sessions?pinned=true`, independent of the sidebar's paginated
  * window. Pins now live on the server (a session label) so they follow the
  * user across devices; this query is the source of truth for which sessions
  * are pinned and supplies the rows for any pin that sits outside the loaded
  * list. A generous single page (100) covers realistic pin counts.
+ *
+ * A pre-upgrade server doesn't know the `pinned` param and silently ignores
+ * it (FastAPI drops unknown query params), returning an ordinary session page.
+ * We defend against that by keeping only rows that actually carry the
+ * `omnigent.pinned` label and reporting `filterHonored: false` whenever the
+ * server handed back rows that aren't pinned — the signal the sidebar uses to
+ * skip the destructive localStorage migration against an old server.
  */
-export async function fetchPinnedConversations(): Promise<Conversation[]> {
+export async function fetchPinnedConversations(): Promise<PinnedConversationsResult> {
   const params = new URLSearchParams({
     order: "desc",
     sort_by: "updated_at",
@@ -788,12 +863,29 @@ export async function fetchPinnedConversations(): Promise<Conversation[]> {
   });
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return ((await res.json()) as ConversationsPage).data;
+  const rows = ((await res.json()) as ConversationsPage).data;
+  const conversations = rows.filter((c) => c.labels?.[PINNED_LABEL_KEY] != null);
+  // Honored iff the server returned nothing, or everything it returned is
+  // actually pinned. An old server returns unfiltered rows (none pinned), so a
+  // non-empty raw page with fewer pinned rows means the filter was ignored.
+  //
+  // Ambiguity: an EMPTY page is treated as honored, but "new server, no pins"
+  // and "old server, zero sessions" are indistinguishable here — we infer
+  // honored-ness from row contents rather than an explicit capability marker.
+  // This is safe in practice: an old server returns an empty page only when the
+  // account has no sessions at all, so any leftover localStorage pin ids point
+  // at sessions that no longer exist. The migration's PATCH to those ids 404s,
+  // the write is recorded as failed, and the id is RETAINED in localStorage
+  // (not cleared) — so no pin is lost even in this corner. Closing the window
+  // fully would need a server capability flag; deferred since pins haven't
+  // shipped yet.
+  const filterHonored = rows.length === 0 || conversations.length === rows.length;
+  return { conversations, filterHonored };
 }
 
 /** Server-authoritative list of the viewer's pinned sessions. */
 export function usePinnedConversations() {
-  return useQuery<Conversation[]>({
+  return useQuery<PinnedConversationsResult>({
     queryKey: PINNED_CONVERSATIONS_KEY,
     queryFn: fetchPinnedConversations,
     staleTime: 30_000,
@@ -841,9 +933,27 @@ export async function setConversationPinned(
  * timestamp until the pinned query refetched (a blank time field on the new
  * row). For the same reason the list overlay carries only `labels`, so pinning
  * can't blank an existing row's timestamp.
+ *
+ * Old-server fallback: when the server can't store pins (`filterHonored` is
+ * false — a pre-upgrade server that ignores `?pinned=true`), a PATCH would
+ * persist a bare `omnigent.pinned` key that the upgraded server discards on
+ * read (it only surfaces the caller's per-user `omnigent.pinned.<user>` key),
+ * so the pin would silently vanish on the server upgrade. Instead we write the
+ * pin to localStorage — the same store the pre-upgrade UI used — so it survives
+ * and later migrates through `useMigrateLocalPinsToServer` like any other
+ * pre-upgrade pin. The optimistic cache patch still runs, and the sidebar
+ * unions localStorage pins into the Pinned section, so it shows immediately.
  */
 export function useTogglePinnedConversation() {
   const queryClient = useQueryClient();
+
+  // Whether the server can store pins. Sourced from the pinned query's
+  // `filterHonored`; defaults to true when the query hasn't loaded (a manual
+  // toggle implies a reachable, working server — the same assumption the cache
+  // patch below makes).
+  const serverCanStorePins = (): boolean =>
+    queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)?.filterHonored ??
+    true;
 
   // Locate the fullest cached row for an id, so the pinned insert keeps a real
   // `updated_at` (the PATCH snapshot lacks it). A project session lives only in
@@ -851,7 +961,9 @@ export function useTogglePinnedConversation() {
   // window, so that cache is searched too — otherwise its pinned row would be
   // built from the timestamp-less snapshot.
   const findRow = (id: string): Conversation | undefined =>
-    queryClient.getQueryData<Conversation[]>(PINNED_CONVERSATIONS_KEY)?.find((c) => c.id === id) ??
+    queryClient
+      .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+      ?.conversations.find((c) => c.id === id) ??
     queryClient
       .getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] })
       .flatMap(([, data]) => data?.pages.flatMap((p) => p.data) ?? [])
@@ -887,9 +999,13 @@ export function useTogglePinnedConversation() {
     queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, labels } : old));
     // Add the row on pin (its label carries the pin timestamp the sidebar sorts
     // by) built from the existing row + labels; drop it on unpin.
-    queryClient.setQueryData<Conversation[]>(PINNED_CONVERSATIONS_KEY, (old) => {
-      const rest = (old ?? []).filter((c) => c.id !== id);
-      if (!pinned) return rest;
+    queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) => {
+      // Preserve the query's `filterHonored` flag; the toggle only mutates the
+      // list. If the query hasn't loaded yet, an optimistic patch implies the
+      // server can store pins, so treat it as honored.
+      const prev = old ?? { conversations: [], filterHonored: true };
+      const rest = prev.conversations.filter((c) => c.id !== id);
+      if (!pinned) return { ...prev, conversations: rest };
       // Prefer the full cached row (keeps title/updated_at); fall back to a
       // minimal row when the session isn't in any loaded cache (rare — the pin
       // affordance lives on a visible row). The pinned query refetch fills the
@@ -897,19 +1013,33 @@ export function useTogglePinnedConversation() {
       const row: Conversation = existing
         ? { ...existing, labels }
         : ({ id, object: "conversation", labels } as Conversation);
-      return [...rest, row];
+      return { ...prev, conversations: [...rest, row] };
     });
   };
 
   return useMutation({
-    mutationFn: ({ id, pinned }: { id: string; pinned: boolean }) =>
-      setConversationPinned(id, pinned),
+    mutationFn: ({ id, pinned }: { id: string; pinned: boolean }) => {
+      // Against an old server, persist the pin locally instead of PATCHing a
+      // bare key it would store but the upgraded server would drop on read.
+      if (!serverCanStorePins()) {
+        // Throws if the local write fails (e.g. storage full) — a sync throw
+        // here rejects the mutation, so `onError` rolls back the optimistic
+        // patch rather than reporting a success that won't survive a reload.
+        setLegacyPinnedConversationId(id, pinned);
+        // Resolve with a minimal snapshot; the optimistic patch already moved
+        // the row and there's no server row to reconcile.
+        const labels = pinned ? { [PINNED_LABEL_KEY]: String(Date.now()) } : {};
+        return Promise.resolve({ id, object: "conversation", labels } as Conversation);
+      }
+      return setConversationPinned(id, pinned);
+    },
     // Move the row immediately — don't wait for the PATCH round-trip. Without
     // this the row lingers in its project folder (or the flat list) until the
     // network resolves, which reads as lag. Snapshot the pinned cache so a
     // failed PATCH rolls back.
     onMutate: ({ id, pinned }) => {
-      const prevPinned = queryClient.getQueryData<Conversation[]>(PINNED_CONVERSATIONS_KEY);
+      const prevPinned =
+        queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
       const base = findRow(id)?.labels ?? {};
       const labels: Record<string, string> = pinned
         ? { ...base, [PINNED_LABEL_KEY]: String(Date.now()) }
@@ -1235,8 +1365,8 @@ async function archiveAndUnfileConversation(id: string): Promise<Conversation> {
  * archived, so they leave the sidebar but keep their history. Accepts the
  * folder's `{ id, name }`: `name` drives the member sweep (dual-read
  * `?project=`), `id` deletes the container (skipped for a label-only folder,
- * which has none). Throws `{ failed, succeeded, total }` if any member failed
- * (e.g. a shared session the user can't modify), leaving those in place.
+ * which has none). Throws a `BulkConversationMutationError` if any member
+ * failed (e.g. a shared session the user can't modify), leaving those in place.
  */
 export function useDeleteProject() {
   const queryClient = useQueryClient();
@@ -1257,7 +1387,13 @@ export function useDeleteProject() {
           failed.push(ids[i]);
         }
       }
-      if (failed.length > 0) throw { failed, succeeded, total: ids.length };
+      if (failed.length > 0) {
+        throw new BulkConversationMutationError("archive and unfile", {
+          failed,
+          succeeded,
+          total: ids.length,
+        });
+      }
       // All members detached — remove the first-class container if present.
       // (A label-only folder has no row; clearing the labels above already
       // makes it vanish from the project list.)

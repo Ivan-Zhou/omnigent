@@ -14,6 +14,8 @@
 // per-session snapshot API so the REAL useSession / useRootSessionId chain
 // resolves the child up to its root.
 
+import type * as SessionsApiModule from "@/lib/sessionsApi";
+
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -30,7 +32,10 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useConnectedConversations: () => [],
   useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversations: () => ({ data: [], isSuccess: true }),
+  usePinnedConversations: () => ({
+    data: { conversations: [], filterHonored: true },
+    isSuccess: true,
+  }),
   useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
   setConversationPinned: vi.fn(() => Promise.resolve({})),
   PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
@@ -52,7 +57,7 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 // The snapshot API feeds the real useSession / useRootSessionId walk: the
 // child reports its parent, the parent reports null (top-level).
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/sessionsApi")>()),
+  ...(await importOriginal<typeof SessionsApiModule>()),
   getSessionSlim: vi.fn(),
 }));
 
