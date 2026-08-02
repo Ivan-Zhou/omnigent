@@ -190,6 +190,48 @@ async def test_create_claude_session_persists_terminal_launch_args() -> None:
     assert BRIDGE_ID_LABEL_KEY.encode() not in body
 
 
+def test_remote_claude_launch_applies_configured_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    ``omnigent claude`` applies the configured default model.
+
+    Other native launchers read ``config model=...`` and persist it on the
+    session so the daemon runner starts the terminal with the requested model.
+    Claude-native must do the same; otherwise a stale host env/alias can keep
+    launching ``--model opus`` even after the user changes their default.
+    """
+    spec_path = tmp_path / "claude.yaml"
+    spec_path.write_text("name: claude-native-ui\nprompt: hi\n")
+    captured: dict[str, Any] = {}
+    ensured: list[str] = []
+    prepared = claude_native.PreparedClaudeTerminal(
+        session_id="conv_new",
+        terminal_id=claude_native.claude_terminal_resource_id(),
+        bridge_dir=tmp_path / "bridge",
+        reattached=False,
+    )
+    _install_daemon_seam_mocks(
+        monkeypatch,
+        prepared=prepared,
+        attach_outcome=claude_native._AttachOutcome.EXITED,
+        captured=captured,
+        ensured=ensured,
+    )
+
+    claude_native._run_with_remote_server(
+        "https://example.com",
+        spec_path,
+        session_id=None,
+        resume_picker=False,
+        claude_args=(),
+        model="databricks-claude-opus-5",
+    )
+
+    assert captured["model"] == "databricks-claude-opus-5"
+
+
 def _install_daemon_seam_mocks(
     monkeypatch: pytest.MonkeyPatch,
     *,

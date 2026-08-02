@@ -195,6 +195,7 @@ def register_native_commands(cli: click.Group) -> None:
         cfg = _load_effective_config()
         if server is None:
             server = cfg.get("server")
+        model = cfg.get("model")
         auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
         startup_profiler.mark("config resolved")
 
@@ -252,6 +253,7 @@ def register_native_commands(cli: click.Group) -> None:
             auto_open_conversation=auto_open_conversation,
             startup_profiler=startup_profiler,
             command=resolved_command,
+            model=model,
         )
 
     @cli.command(
