@@ -44,12 +44,12 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib import error, request
 
 from omnigent._platform import stable_user_id
@@ -122,6 +122,8 @@ _TOOL_CALL_TIMEOUT_S = 300.0
 # below the real round-trip latency under load, so slow-but-healthy calls
 # (session history reads, shell) tripped it and crashed the bridge.
 _TOOL_RELAY_POST_TIMEOUT_S = _TOOL_CALL_TIMEOUT_S + 30.0
+# Backstop per-request threads above any expected client tool-call fan-out.
+_MAX_CONCURRENT_MCP_REQUESTS = 64
 # Web-UI → Claude input now flows through tmux send-keys, not
 # Claude's experimental Channels MCP capability. The runner writes
 # ``tmux.json`` after the Claude terminal launches; the harness
@@ -893,6 +895,31 @@ def build_claude_native_spawn_env(
     }
 
 
+def _bridge_sandbox_payload(sandbox: OSEnvSandboxSpec) -> dict[str, Any]:
+    """
+    Build the JSON-safe sandbox payload persisted into the bridge config.
+
+    ``dataclasses.asdict`` flattens ``credential_proxy`` (a nested
+    ``CredentialProxySpec``) to a plain dict with no way to tell it apart
+    from a real one on read, so a naive ``OSEnvSandboxSpec(**payload)``
+    round-trip silently stores a ``dict`` where a ``CredentialProxySpec``
+    is expected — a real crash the first time sandboxed code dereferences
+    ``.entries`` / ``.databricks`` on it. ``credential_proxy`` is resolved
+    parent-side only and is never meant to cross a serialization boundary
+    in the first place — :func:`omnigent.inner.sandbox.SandboxPolicy.to_jsonable`
+    excludes it for the same reason (it can carry a credential *source*,
+    e.g. an env var name or a shell command, that has no business landing
+    in a file on disk). Dropping it here matches that existing convention
+    instead of inventing a new one.
+
+    :param sandbox: Resolved sandbox spec to serialize.
+    :returns: JSON-safe dict with ``credential_proxy`` omitted.
+    """
+    payload = asdict(sandbox)
+    payload.pop("credential_proxy", None)
+    return payload
+
+
 def prepare_bridge_dir(
     conversation_id: str,
     *,
@@ -900,6 +927,7 @@ def prepare_bridge_dir(
     workspace: Path,
     launch_model: str | None = None,
     launch_env: Mapping[str, str] | None = None,
+    sandbox: OSEnvSandboxSpec | None = None,
 ) -> Path:
     """
     Create or refresh the bridge directory for a native Claude session.
@@ -919,6 +947,14 @@ def prepare_bridge_dir(
         ``ANTHROPIC_CUSTOM_MODEL_OPTION``) are persisted so runner-side
         callers — which don't share the terminal's env — can translate a
         routed model id into a ``/model`` argument the CLI accepts.
+    :param sandbox: Resolved ``os_env.sandbox`` for this session (the
+        agent spec's declared sandbox, already overridden by any
+        ``enforce_sandbox``/``force_sandbox`` policy verdict). Persisted
+        so :func:`_build_tools` can build the bridge's own
+        ``sys_os_*`` tools against it instead of always running
+        unsandboxed. ``None`` preserves the prior unsandboxed default.
+        Its ``credential_proxy`` is never written — see
+        :func:`_bridge_sandbox_payload`.
     :returns: Bridge directory path.
     """
     resolved_bridge_id = bridge_id or conversation_id
@@ -945,6 +981,8 @@ def prepare_bridge_dir(
     }
     if model_env:
         payload["model_env"] = model_env
+    if sandbox is not None:
+        payload["sandbox"] = _bridge_sandbox_payload(sandbox)
     _write_json_file(bridge_dir / _CONFIG_FILE, payload)
     # Keep ``_PERMISSION_HOOK_FILE`` — the PermissionRequest command hook
     # reads the Omnigent server URL from it at runtime, so wiping it on re-prep
@@ -1793,15 +1831,35 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
     event_name = payload.get("hook_event_name")
     if isinstance(event_name, str) and event_name:
         state["last_hook_event_name"] = event_name
-    transcript_path = payload.get("transcript_path")
-    if isinstance(transcript_path, str) and transcript_path:
-        state["transcript_path"] = transcript_path
     claude_session_id = payload.get("session_id")
-    if isinstance(claude_session_id, str) and claude_session_id:
-        state["claude_session_id"] = claude_session_id
-        seen = read_seen_claude_session_ids(bridge_dir)
-        seen.add(claude_session_id)
-        state["seen_claude_session_ids"] = sorted(seen)
+    pinned = state.get("claude_session_id")
+    # Identity pin: the transcript path and session identity may change only
+    # via a SessionStart announcement (startup / clear / resume / compact all
+    # fire one) or an event from the already-pinned session. A side-channel
+    # event carrying another session's identity (e.g. a background Task
+    # agent's edge) must not re-aim the forwarder at a foreign transcript.
+    identity_allowed = event_name == "SessionStart" or (
+        isinstance(claude_session_id, str)
+        and claude_session_id != ""
+        and (not isinstance(pinned, str) or not pinned or claude_session_id == pinned)
+    )
+    if identity_allowed:
+        transcript_path = payload.get("transcript_path")
+        if isinstance(transcript_path, str) and transcript_path:
+            state["transcript_path"] = transcript_path
+        if isinstance(claude_session_id, str) and claude_session_id:
+            state["claude_session_id"] = claude_session_id
+            seen = read_seen_claude_session_ids(bridge_dir)
+            seen.add(claude_session_id)
+            state["seen_claude_session_ids"] = sorted(seen)
+    else:
+        _logger.debug(
+            "Ignoring identity fields from side-channel hook event; "
+            "event=%s session_id=%s pinned=%s",
+            event_name,
+            claude_session_id,
+            pinned,
+        )
     state["updated_at"] = time.time()
     _write_json_file(bridge_dir / _STATE_FILE, state)
 
@@ -2107,6 +2165,7 @@ def read_transcript_items_since_with_position(
     *,
     agent_name: str,
     current_response_id: str | None = None,
+    settled_response_id: str | None = None,
 ) -> TranscriptReadResult:
     """
     Read transcript items from a line cursor and return byte position.
@@ -2124,6 +2183,9 @@ def read_transcript_items_since_with_position(
         tool-call items, e.g. ``"claude-native-ui"``.
     :param current_response_id: Response id for an in-progress
         Claude assistant turn from a previous poll.
+    :param settled_response_id: Response id whose turn already ended
+        (its ``Stop`` edge posted) — assistant output inheriting it is
+        a scheduled/automatic wake and opens a new marked turn.
     :returns: Parsed items plus line and byte cursors.
     """
     read_result = _read_complete_jsonl_records(
@@ -2134,6 +2196,7 @@ def read_transcript_items_since_with_position(
     )
     items: list[ClaudeTranscriptItem] = []
     active_response_id = current_response_id
+    active_settled_id = settled_response_id
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     for record in read_result.records:
@@ -2151,8 +2214,14 @@ def read_transcript_items_since_with_position(
             record_offset=None,
             agent_name=agent_name,
             current_response_id=active_response_id,
+            settled_response_id=active_settled_id,
         )
         items.extend(parsed)
+        # Post-compaction output continues the SAME turn: a batch holding
+        # the compact summary AND the resumed output must not parse the
+        # resume against a still-armed settle (spurious wake marker).
+        if any(item.is_compact_summary for item in parsed):
+            active_settled_id = None
         usage = _usage_from_transcript_entry(entry)
         if usage is not None:
             latest_usage = usage
@@ -2176,6 +2245,7 @@ def read_transcript_items_from_offset(
     start_line: int,
     agent_name: str,
     current_response_id: str | None = None,
+    settled_response_id: str | None = None,
     include_sidechains: bool = False,
 ) -> TranscriptReadResult:
     """
@@ -2196,6 +2266,9 @@ def read_transcript_items_from_offset(
         tool-call items, e.g. ``"claude-native-ui"``.
     :param current_response_id: Response id for an in-progress
         Claude assistant turn from a previous poll.
+    :param settled_response_id: Response id whose turn already ended
+        (its ``Stop`` edge posted) — assistant output inheriting it is
+        a scheduled/automatic wake and opens a new marked turn.
     :param include_sidechains: Pass ``True`` when reading a
         sub-agent's own ``agent-<id>.jsonl`` — every record there is
         a sidechain by Claude's definition, and dropping them would
@@ -2211,6 +2284,7 @@ def read_transcript_items_from_offset(
     )
     items: list[ClaudeTranscriptItem] = []
     active_response_id = current_response_id
+    active_settled_id = settled_response_id
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     for record in read_result.records:
@@ -2228,9 +2302,15 @@ def read_transcript_items_from_offset(
             record_offset=record.byte_offset,
             agent_name=agent_name,
             current_response_id=active_response_id,
+            settled_response_id=active_settled_id,
             include_sidechains=include_sidechains,
         )
         items.extend(parsed)
+        # Post-compaction output continues the SAME turn: a batch holding
+        # the compact summary AND the resumed output must not parse the
+        # resume against a still-armed settle (spurious wake marker).
+        if any(item.is_compact_summary for item in parsed):
+            active_settled_id = None
         usage = _usage_from_transcript_entry(entry)
         if usage is not None:
             latest_usage = usage
@@ -3884,6 +3964,12 @@ def _handler_factory(
     return _ControlHandler
 
 
+# Cap for the upstream-failure detail echoed in the policy-eval proxy's 502
+# body. Applied to the detail before the fixed prefix so the leading cause is
+# never cut mid-reason by the truncation.
+_POLICY_PROXY_ERROR_DETAIL_MAX = 400
+
+
 def _tool_relay_handler_factory(
     token: str,
     tool_executor: ToolExecutor,
@@ -3958,8 +4044,8 @@ def _tool_relay_handler_factory(
             future = asyncio.run_coroutine_threadsafe(policy_client.post(url, json=payload), loop)
             try:
                 resp = future.result(timeout=86400.0)
-            except Exception:  # noqa: BLE001
-                self.send_error(HTTPStatus.BAD_GATEWAY)
+            except Exception as exc:  # noqa: BLE001
+                self._send_policy_proxy_error(exc)
                 return
             raw = resp.content
             self.send_response(resp.status_code)
@@ -3971,6 +4057,37 @@ def _tool_relay_handler_factory(
                 self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
+
+        def _send_policy_proxy_error(self, exc: Exception) -> None:
+            """Return a 502 whose body names why the upstream forward failed.
+
+            The default ``send_error`` writes a generic ``http.server`` HTML
+            page; the policy hook truncates that body into its fail-closed
+            ``Detail:``, so a bare page reads as an opaque gateway blip. Most
+            failures here are a Databricks token-refresh lapse the
+            refresh-capable client surfaces as ``httpx.RequestError`` — lead the
+            body with that cause so the blocked-turn message is actionable.
+
+            :param exc: The exception raised by the upstream policy POST.
+            :returns: None.
+            """
+            reason = str(exc).strip()
+            detail = f"{type(exc).__name__}: {reason}" if reason else type(exc).__name__
+            # Truncate the detail (not the composed message) so the leading
+            # cause always survives intact instead of being cut mid-reason once
+            # the fixed prefix is prepended.
+            if len(detail) > _POLICY_PROXY_ERROR_DETAIL_MAX:
+                detail = detail[: _POLICY_PROXY_ERROR_DETAIL_MAX - 3] + "..."
+            message = f"omnigent policy-eval proxy could not reach the Omnigent server: {detail}"
+            # Keep the full exception (with traceback) in the runner log; the
+            # user-facing body is capped and can drop a diagnostically useful tail.
+            _logger.warning("policy-eval proxy forward failed: %s", detail, exc_info=exc)
+            body = message.encode("utf-8", "replace")
+            self.send_response(HTTPStatus.BAD_GATEWAY)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def _read_json_body(self) -> _JsonObject | None:
             """
@@ -4088,6 +4205,7 @@ def _stdio_jsonrpc_loop(
     :returns: None when stdin reaches EOF.
     """
     use_content_length = False
+    request_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_MCP_REQUESTS)
     while True:
         raw_line = sys.stdin.buffer.readline()
         if raw_line == b"":
@@ -4122,29 +4240,80 @@ def _stdio_jsonrpc_loop(
         method = message.get("method")
         if request_id is None or not isinstance(method, str):
             continue
-        # Per-request guard: a failure handling ONE request must never tear
-        # down the long-lived MCP server (which would surface to Claude Code
-        # as ``-32000: Connection closed`` and drop every tool until respawn).
-        # Convert any handler exception into a JSON-RPC error response so the
-        # offending call fails cleanly and the stdio loop keeps serving. The
-        # individual handlers already return ``_mcp_error`` content for
-        # expected failures; this catches the unexpected (e.g. a bug in a
-        # tool, or an OSError that slipped a narrower except).
-        try:
-            result = _handle_mcp_request(method, message.get("params"), tools, bridge_dir)
-            response: _JsonObject = {
+        if request_slots.acquire(blocking=False):
+            request_thread = threading.Thread(
+                target=_handle_and_write_mcp_request,
+                args=(
+                    request_id,
+                    method,
+                    message.get("params"),
+                    tools,
+                    bridge_dir,
+                    stdout_lock,
+                    use_content_length,
+                    request_slots,
+                ),
+                name="claude-native-mcp-request",
+                daemon=True,
+            )
+            try:
+                request_thread.start()
+            except RuntimeError:
+                request_slots.release()
+            else:
+                continue
+        _write_jsonrpc(
+            {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": result,
-            }
-        except Exception as exc:  # noqa: BLE001 - top-level loop guard keeps the server alive.
-            response = {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                # -32603 is the JSON-RPC 2.0 "Internal error" code.
-                "error": {"code": -32603, "message": f"internal error: {exc}"},
-            }
-        _write_jsonrpc(response, stdout_lock, framed=use_content_length)
+                "error": {"code": -32000, "message": "server busy"},
+            },
+            stdout_lock,
+            framed=use_content_length,
+        )
+
+
+def _handle_and_write_mcp_request(
+    request_id: object,
+    method: str,
+    params: object,
+    tools: dict[str, Tool],
+    bridge_dir: Path,
+    stdout_lock: threading.Lock,
+    framed: bool,
+    request_slots: threading.BoundedSemaphore,
+) -> None:
+    """
+    Handle one request without blocking the stdio reader.
+
+    :param request_id: JSON-RPC request identifier returned to the client.
+    :param method: JSON-RPC method name.
+    :param params: Method parameters from the request.
+    :param tools: Omnigent tools exposed over MCP.
+    :param bridge_dir: Bridge directory used to resolve the active relay.
+    :param stdout_lock: Lock serializing responses and notifications.
+    :param framed: Whether to emit a Content-Length framed response.
+    :param request_slots: Concurrency slot released after the response.
+    :returns: None after the response is written.
+    """
+    # A request failure must not tear down the long-lived MCP server.
+    try:
+        result = _handle_mcp_request(method, params, tools, bridge_dir)
+        response: _JsonObject = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": result,
+        }
+    except Exception as exc:  # noqa: BLE001 - request failure must not stop the server.
+        response = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32603, "message": f"internal error: {exc}"},
+        }
+    try:
+        _write_jsonrpc(response, stdout_lock, framed=framed)
+    finally:
+        request_slots.release()
 
 
 def _handle_mcp_request(
@@ -4420,7 +4589,14 @@ def _build_tools(config: _JsonObject) -> tuple[dict[str, Tool], Callable[[], Non
     """
     Build Omnigent MCP tools served by the bridge.
 
-    :param config: Bridge config JSON object.
+    :param config: Bridge config JSON object. An optional ``"sandbox"``
+        key, written by :func:`prepare_bridge_dir` from the session's
+        resolved ``os_env.sandbox`` (policy overrides included), is
+        applied to the ``sys_os_*`` tools built here. Its absence
+        (older bridge configs, or sessions with no sandbox to carry)
+        falls back to the prior unsandboxed default. ``credential_proxy``
+        is never present (see :func:`_bridge_sandbox_payload`), so the
+        rebuilt spec always has it unset here.
     :returns: ``(tools, close_tools)`` where ``close_tools``
         releases any helper processes.
     """
@@ -4428,10 +4604,16 @@ def _build_tools(config: _JsonObject) -> tuple[dict[str, Tool], Callable[[], Non
     workspace = Path(workspace_raw) if isinstance(workspace_raw, str) and workspace_raw else None
     os_env: OSEnvironment | None = None
     if workspace is not None:
+        sandbox_payload = config.get("sandbox")
+        sandbox = (
+            OSEnvSandboxSpec(**sandbox_payload)
+            if isinstance(sandbox_payload, dict)
+            else OSEnvSandboxSpec(type="none")
+        )
         spec = OSEnvSpec(
             type="caller_process",
             cwd=str(workspace),
-            sandbox=OSEnvSandboxSpec(type="none"),
+            sandbox=sandbox,
             fork=False,
         )
         os_env = create_os_environment(spec)
@@ -4690,6 +4872,7 @@ def _transcript_items_from_entry(
     record_offset: int | None = None,
     agent_name: str,
     current_response_id: str | None,
+    settled_response_id: str | None = None,
     include_sidechains: bool = False,
 ) -> tuple[str | None, list[ClaudeTranscriptItem]]:
     """
@@ -4750,6 +4933,7 @@ def _transcript_items_from_entry(
             record_offset=record_offset,
             agent_name=agent_name,
             current_response_id=current_response_id,
+            settled_response_id=settled_response_id,
         )
     return current_response_id, []
 
@@ -5347,6 +5531,7 @@ def _assistant_transcript_items_from_entry(
     record_offset: int | None,
     agent_name: str,
     current_response_id: str | None,
+    settled_response_id: str | None = None,
 ) -> tuple[str | None, list[ClaudeTranscriptItem]]:
     """
     Parse a Claude ``role=assistant`` transcript entry.
@@ -5358,13 +5543,25 @@ def _assistant_transcript_items_from_entry(
     :param agent_name: Agent/model name for assistant/tool items.
     :param current_response_id: Response id for the active Claude
         assistant turn.
+    :param settled_response_id: Response id of a turn whose terminal
+        ``Stop`` edge has already been forwarded. Assistant output that
+        would inherit it proves a scheduled/automatic prompt (cron
+        firing, wakeup) started a NEW turn — those re-invocations write
+        no user transcript entry, so without this the resumed output
+        extends the finished turn forever. Such output gets a fresh
+        response id plus a leading wake marker item.
     :returns: Updated active response id and parsed assistant/tool
         items.
     """
     message = entry["message"]
     content = message.get("content") if isinstance(message, dict) else None
     source_key = _transcript_source_key(entry, line_number, record_offset)
-    response_id = current_response_id or _response_id_from_source(source_key)
+    waking = current_response_id is not None and current_response_id == settled_response_id
+    response_id = (
+        _response_id_from_source(source_key)
+        if waking
+        else current_response_id or _response_id_from_source(source_key)
+    )
     items: list[ClaudeTranscriptItem] = []
 
     if isinstance(content, str):
@@ -5378,6 +5575,12 @@ def _assistant_transcript_items_from_entry(
                     text=content,
                 )
             )
+        if waking:
+            # Consume the wake only when the entry produced output — an
+            # empty entry must not burn the fresh id on nothing.
+            if not items:
+                return current_response_id, items
+            items.insert(0, _scheduled_wake_marker_item(source_key, response_id))
         return response_id, items
 
     if not isinstance(content, list):
@@ -5423,7 +5626,35 @@ def _assistant_transcript_items_from_entry(
                     response_id=response_id,
                 )
             )
+    if waking and items:
+        items.insert(0, _scheduled_wake_marker_item(source_key, response_id))
     return response_id if items else current_response_id, items
+
+
+_SCHEDULED_WAKE_MARKER_TEXT = "[System: scheduled prompt fired]"
+
+
+def _scheduled_wake_marker_item(source_key: str, response_id: str) -> ClaudeTranscriptItem:
+    """
+    Build the turn-boundary marker for a scheduled/automatic wake.
+
+    A plain (non-meta) user item on purpose: the web classifies
+    ``[System: ...]`` text as a muted system row and splits assistant
+    bubbles on it, giving each wake its own turn and "Worked for" fold.
+
+    :param source_key: Source key of the waking assistant entry.
+    :param response_id: Fresh response id minted for the new turn.
+    :returns: The marker conversation item.
+    """
+    return ClaudeTranscriptItem(
+        source_id=_source_id(source_key, 0, "scheduled_wake"),
+        item_type="message",
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": _SCHEDULED_WAKE_MARKER_TEXT}],
+        },
+        response_id=response_id,
+    )
 
 
 _CONTEXT_OVERFLOW_RE = re.compile(
