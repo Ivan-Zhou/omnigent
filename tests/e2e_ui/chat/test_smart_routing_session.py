@@ -111,9 +111,77 @@ def test_routed_session_renders_one_routing_chip(
     # The pick itself, and who made it.
     expect(chip).to_contain_text("opus")
     expect(chip.get_by_test_id("routing-decision-source-databricks")).to_be_visible()
-    expect(chip.get_by_test_id("routing-decision-harness")).to_contain_text("claude-native")
+    session_harness = chip.get_by_test_id("routing-decision-harness")
+    expect(session_harness).to_contain_text("claude")
+    expect(session_harness).not_to_contain_text("claude-native")
     # The turn chip is the survivor, so the scope reads as the turn's.
     expect(chip).to_have_attribute("data-applied", "true")
+
+
+def test_spawn_chip_says_the_short_harness_name(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A sub-agent spawn chip says "codex", not the "-native" implementation id.
+
+    Every chip shortens the id this way; the session's own chip is covered
+    above.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
+        session.
+    :returns: None.
+    """
+    from omnigent.entities import NewConversationItem
+    from omnigent.entities.conversation import parse_item_data
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from tests.e2e_ui.conftest import _server_state
+
+    base_url, session_id = seeded_session
+    database_uri = _server_state.get("database_uri")
+    assert database_uri, "needs the spawned server's database (not --ui-base-url)"
+    store = SqlAlchemyConversationStore(str(database_uri))
+    store.append(
+        session_id,
+        [
+            NewConversationItem(
+                type="routing_decision",
+                response_id="routing_e2e_spawn",
+                data=parse_item_data(
+                    "routing_decision",
+                    {
+                        "model": "databricks-gpt-5-6-luna",
+                        "applied": True,
+                        "rationale": "Trivial task; cheapest arm.",
+                        "harness": "codex-native",
+                        "scope": "native_subagent",
+                        "decision_id": "e2e-decision-spawn",
+                        "router_source": "databricks-aigw",
+                        "agent_name": "researcher",
+                    },
+                ),
+            ),
+        ],
+    )
+    seed_committed_turn(session_id, prompt="spawn a researcher", reply="spawned")
+    # The spawn chip renders only while the session's switch is on.
+    patched = httpx.patch(
+        f"{base_url}/v1/sessions/{session_id}",
+        json={"subagent_routing_override": "on"},
+        timeout=10.0,
+    )
+    patched.raise_for_status()
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    chip = page.get_by_test_id("routing-decision-card")
+    expect(chip).to_have_count(1, timeout=15_000)
+    harness = chip.get_by_test_id("routing-decision-harness")
+    expect(harness).to_contain_text("codex")
+    expect(harness).not_to_contain_text("codex-native")
+    expect(chip.get_by_test_id("routing-decision-scope")).to_contain_text("subagent")
 
 
 def test_routed_session_config_modal_names_the_routed_model(
@@ -132,20 +200,22 @@ def test_routed_session_config_modal_names_the_routed_model(
     :returns: None.
     """
     base_url, session_id = seeded_session
-    _patch_session_as_claude_native(page, session_id, model_override=_ROUTED_MODEL)
+    _patch_session_as_claude_native(page, session_id, llm_model=_ROUTED_MODEL)
 
     page.goto(f"{base_url}/c/{session_id}")
 
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
+    page.get_by_test_id("composer-agent-edit").click()
 
-    model_row = page.get_by_test_id("composer-config-model")
+    model_row = page.get_by_test_id("composer-agent-models")
     expect(model_row).to_be_visible()
     expect(model_row).to_contain_text(_ROUTED_MODEL)
 
     # The row also OFFERS it, alongside the harness's own aliases — a pinned
     # model that no option declares is what rendered blank.
-    model_row.click()
-    expect(page.locator(f'[role="option"][data-model-id="{_ROUTED_MODEL}"]')).to_have_count(1)
-    expect(page.locator('[role="option"][data-model-id="sonnet"]')).to_have_count(1)
+    expect(
+        page.locator(f'[role="menuitemcheckbox"][data-model-id="{_ROUTED_MODEL}"]')
+    ).to_have_count(1)
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="sonnet"]')).to_have_count(1)

@@ -1,7 +1,7 @@
 """Shared subagent-routing decision logic for harness hooks.
 
 Stdlib-only on purpose (bar the equally light
-:mod:`omnigent.claude_model_vocabulary`): the Claude-native hook runs as
+:mod:`omnigent.models.claude_model_vocabulary`): the Claude-native hook runs as
 a per-spawn subprocess (``python -I -m
 omnigent.inner.hook_scripts.claude_router_hook``) and blocks the spawn,
 so importing anything heavier would show up as spawn latency. The
@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from omnigent.claude_model_vocabulary import (
+from omnigent.models.claude_model_vocabulary import (
     CLAUDE_MODEL_ALIASES,
     alias_pins,
     claude_model_alias,
@@ -99,11 +99,12 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
 # the runner answers first, smaller than the harness's hook timeout so this
 # script's fail-open branch can run.
 #
-# Single digits on purpose. This gate holds the parent agent's spawn tool open
-# until it answers, so a fail-open that takes half a minute stalls the agent as
-# surely as an error would; the routing call inside it runs on a 5s budget
-# (``omnigent.server.smart_routing.ROUTING_REQUEST_TIMEOUT_S``).
-REQUEST_TIMEOUT_S = 8.0
+# Well under the half-minute a wedged server used to cost, but wide enough to
+# outlast a HEALTHY route: the server prepares the candidate catalog (~3s on a
+# cold session) before the routing call, which itself runs on
+# ``omnigent.server.smart_routing.ROUTING_REQUEST_TIMEOUT_S``. A tighter budget
+# discards verdicts that did arrive.
+REQUEST_TIMEOUT_S = 15.0
 
 # Headroom hop 1 adds over hop 2. Enough for interpreter start-up and the
 # script's fail-open branch, and no more — every second here is a second the

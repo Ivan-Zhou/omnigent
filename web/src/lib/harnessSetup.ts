@@ -8,9 +8,9 @@
  * (API key, gateway) add step kinds server-side and appear here for free.
  */
 
-import type { SetupStepWire } from "@/lib/agentLabels";
+import { isAutoHarness, type SetupStepWire } from "@/lib/agentLabels";
 import type { Host } from "@/hooks/useHosts";
-import type { ServerInfo } from "@/lib/capabilities";
+import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 
 /** Whether a step is satisfied, still needed, or not locally determinable. */
 export type SetupStepStatus = "done" | "todo" | "unknown";
@@ -78,6 +78,22 @@ export function harnessUnavailableReasonOnHost(
   if (typeof availability === "string") {
     return "unconfigured";
   }
+  // Missing key on a host that DOES report readiness (a non-empty map): the host
+  // can't launch this harness — its runner has no catalog row for it, e.g. a host
+  // predating a newly-added harness (jcode on a pre-jcode host, which reports
+  // devin/grok but omits jcode). Treat it as unconfigured so "hide unconfigured"
+  // hides it, instead of failing open and offering a harness the host can't run.
+  // Excludes the client-only Smart Routing "auto" sentinels: the daemon never
+  // reports a readiness key for those, so they must stay selectable and unbadged.
+  // An absent/empty map still fails open (the guard above, plus the size check),
+  // so a host that reports no readiness at all is never emptied out.
+  if (
+    availability === undefined &&
+    !isAutoHarness(harness) &&
+    Object.keys(host.configured_harnesses).length > 0
+  ) {
+    return "unconfigured";
+  }
   return null;
 }
 
@@ -124,7 +140,7 @@ export function harnessInstallableOnHost(
 ): boolean {
   return (
     info !== "loading" &&
-    info.harness_install_enabled &&
+    isFeatureEnabled(info, "harness_install") &&
     !!harness &&
     info.installable_harnesses.includes(harness) &&
     host?.status === "online"
@@ -182,7 +198,7 @@ export function harnessAuthableOnHost(
 ): boolean {
   return (
     info !== "loading" &&
-    info.harness_install_enabled &&
+    isFeatureEnabled(info, "harness_install") &&
     harnessCredentialFamily(harness) !== null &&
     host?.status === "online"
   );

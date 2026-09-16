@@ -34,6 +34,7 @@ CANARY_SECRETS = {
     "GITHUB_TOKEN": "canary-github",
     "SLACK_BOT_TOKEN": "canary-slack",
     "OPENROUTER_API_KEY": "canary-openrouter",
+    "PYTHON_KEYRING_BACKEND": "test_keyring_backend.FileKeyring",
 }
 
 # The per-harness families, matching the decision table on #3445.
@@ -181,6 +182,65 @@ def test_real_builders_pass_node_extra_ca_certs(monkeypatch):
         assert env.get("NODE_EXTRA_CA_CERTS") == "/etc/corp-ca.pem", harness
 
 
+def test_real_builders_pass_ssh_auth_sock(monkeypatch):
+    """ssh-agent must survive filtering, or git-over-SSH breaks in every harness."""
+    sock = "/private/tmp/com.apple.launchd.7Qk/Listeners"
+    monkeypatch.setattr("os.environ", {"SSH_AUTH_SOCK": sock})
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        assert build().get("SSH_AUTH_SOCK") == sock, harness
+
+
+def test_real_builders_strip_desktop_session(monkeypatch):
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+    monkeypatch.setattr("os.environ", {**session_env, "XDG_CONFIG_HOME": "/home/test/.config"})
+
+    for harness, build in sorted(SPAWN_ENV_BUILDERS.items()):
+        env = build()
+        assert session_env.keys().isdisjoint(env), harness
+        assert env["XDG_CONFIG_HOME"] == "/home/test/.config", harness
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_desktop_session_requires_explicit_cli_passthrough(explicit):
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+
+    env = clean_agent_env(
+        allow_prefixes=("DBUS_", "XDG_"),
+        allow_exact=session_env,
+        extra_allowed=session_env if explicit else (),
+        source=session_env,
+    )
+
+    assert env == (session_env if explicit else {})
+
+
+def test_goose_receives_declared_desktop_session(monkeypatch):
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.goose_executor import GooseExecutor
+
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+    monkeypatch.setattr("os.environ", session_env)
+    executor = _bare(
+        GooseExecutor,
+        _provider_env=dict,
+        _os_env=OSEnvSpec(
+            type="caller_process",
+            sandbox=OSEnvSandboxSpec(type="none", env_passthrough=list(session_env)),
+        ),
+    )
+
+    assert executor._build_spawn_env() == session_env
+
+
 @pytest.mark.parametrize("harness", sorted(HARNESS_PREFIXES))
 def test_no_harness_inherits_unrelated_secrets(harness, hostile_env):
     env = clean_agent_env(allow_prefixes=HARNESS_PREFIXES[harness], source=hostile_env)
@@ -232,6 +292,26 @@ def test_deny_exact_beats_a_matching_prefix(hostile_env):
     assert env["OPENAI_BASE_URL"] == "https://x"
 
 
+def test_codex_passes_service_principal_m2m_credentials(hostile_env):
+    """codex's own builder must let the SP M2M pair through, so a
+    Databricks-gateway ``auth.command`` can mint an OAuth token on refresh.
+    The canaried DATABRICKS_CONFIG_PROFILE / DATABRICKS_TOKEN must still not."""
+    from omnigent.inner.codex_executor import _clean_codex_env
+
+    src = {
+        **hostile_env,
+        "DATABRICKS_CLIENT_ID": "sp-app-id",
+        "DATABRICKS_CLIENT_SECRET": "sp-secret",
+    }
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("os.environ", src)
+        env = _clean_codex_env()
+    assert env["DATABRICKS_CLIENT_ID"] == "sp-app-id"
+    assert env["DATABRICKS_CLIENT_SECRET"] == "sp-secret"
+    assert "DATABRICKS_CONFIG_PROFILE" not in env
+    assert "DATABRICKS_TOKEN" not in env
+
+
 def test_source_is_never_mutated(hostile_env):
     before = dict(hostile_env)
     clean_agent_env(allow_prefixes=("QWEN_",), source=hostile_env)
@@ -252,3 +332,23 @@ def test_declared_passthrough_tolerates_a_missing_chain():
 
     assert declared_passthrough(None) == ()
     assert declared_passthrough(_NoSandbox()) == ()
+
+
+def test_acp_agent_declaration_passes_only_what_it_names(hostile_env, monkeypatch):
+    """A generic-ACP agent's own ``env_passthrough`` is an allowlist, not a bypass.
+
+    The executor cannot infer which family an arbitrary agent authenticates
+    with, so the agent names its variables. Everything it does not name stays
+    withheld — a declaration must not reopen the whole environment.
+    """
+    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+
+    monkeypatch.setattr("os.environ", {**hostile_env, "XAI_API_KEY": "declared-and-wanted"})
+    ex = AcpExecutor(
+        AcpAgentConfig(command="agent stdio", name="Grok", env_passthrough=("XAI_API_KEY",))
+    )
+    env = ex._build_spawn_env()
+
+    assert env.get("XAI_API_KEY") == "declared-and-wanted"
+    for name in CANARY_SECRETS:
+        assert name not in env, name

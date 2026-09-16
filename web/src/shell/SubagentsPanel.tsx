@@ -38,6 +38,7 @@ import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
+import { DevinIcon } from "@/components/icons/DevinIcon";
 import { GooseIcon } from "@/components/icons/GooseIcon";
 import { HermesIcon } from "@/components/icons/HermesIcon";
 import { KimiIcon } from "@/components/icons/KimiIcon";
@@ -57,7 +58,11 @@ import { cn } from "@/lib/utils";
 const SubagentsGraphView = lazy(() =>
   import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
 );
-import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import {
+  CLAUDE_NATIVE_SUBAGENT_WRAPPER,
+  nativeCodingAgentForWrapper,
+  WRAPPER_LABEL_KEY,
+} from "@/lib/nativeCodingAgents";
 import {
   activityDotClassName,
   childStatus,
@@ -76,6 +81,7 @@ import { AddAgentDialog } from "./AddAgentDialog";
 const SESSION_SCOPED_PARAMS = ["file", "diff", "comment", "view"] as const;
 const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
 const OPENCODE_NATIVE_SUBAGENT_WRAPPER = "opencode-native-ui-subagent";
+const ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER = "antigravity-native-ui-subagent";
 // Pi children are scaffold (no wrapper label); the spawn title's agent-type head (``tool``) is the signal.
 const PI_AGENT_NAME = "pi";
 type AgentRowIcon = ComponentType<SVGProps<SVGSVGElement>>;
@@ -313,6 +319,7 @@ function brandChildIcon(child: ChildSessionInfo): AgentRowIcon | null {
   if (nativeAgent?.iconKind === "goose") return GooseIcon;
   if (nativeAgent?.iconKind === "kimi") return KimiIcon;
   if (nativeAgent?.iconKind === "hermes") return HermesIcon;
+  if (nativeAgent?.iconKind === "devin") return DevinIcon;
   // Exact match — substring checks would false-match names like "pipeline".
   if (child.tool === PI_AGENT_NAME) return PiIcon;
   return null;
@@ -411,9 +418,15 @@ function childPrimaryLabel(child: ChildSessionInfo): string {
   // rejects "ui" as a sub-agent name.
   const isUserAdded = child.title?.startsWith("ui:") ?? false;
   const childWrapper = child.labels?.[WRAPPER_LABEL_KEY];
+  // agy joins these rather than taking the generic path below: its child title
+  // is ``"<role>:<cascade id>"``, so the first-colon split puts the ROLE in
+  // ``tool`` and the cascade UUID in the suffix — and the generic path returns
+  // ``session_name ?? suffix``, both of which are that UUID.
   const isNativeSubagent =
     childWrapper === CODEX_NATIVE_SUBAGENT_WRAPPER ||
-    childWrapper === OPENCODE_NATIVE_SUBAGENT_WRAPPER;
+    childWrapper === OPENCODE_NATIVE_SUBAGENT_WRAPPER ||
+    childWrapper === ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER ||
+    childWrapper === CLAUDE_NATIVE_SUBAGENT_WRAPPER;
   if (isNativeSubagent && !isUserAdded) {
     return child.tool ?? child.title ?? child.id;
   }
@@ -422,7 +435,9 @@ function childPrimaryLabel(child: ChildSessionInfo): string {
     const titleSuffix = child.title.split(":").slice(1).join(":");
     if (titleSuffix) titleTask = titleSuffix;
   }
-  return child.session_name ?? titleTask ?? child.title ?? child.tool ?? child.id;
+  return (
+    child.task_summary ?? child.session_name ?? titleTask ?? child.title ?? child.tool ?? child.id
+  );
 }
 
 /**
@@ -499,6 +514,7 @@ function iconForWrapperOrHarness(
   if (iconKind === "goose" || harness?.includes("goose")) return GooseIcon;
   if (iconKind === "kimi" || harness?.includes("kimi")) return KimiIcon;
   if (iconKind === "antigravity" || harness?.includes("antigravity")) return AntigravityIcon;
+  if (iconKind === "devin" || harness?.includes("devin")) return DevinIcon;
   // Exact match — a substring check would false-match e.g. "openapi".
   if (iconKind === "pi" || harness === "pi") return PiIcon;
   if (isNessie) return NessieIcon;

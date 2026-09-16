@@ -48,6 +48,17 @@ vi.mock("./ForkSessionDialog", () => ({
     </div>
   ),
 }));
+// The switch dialog owns its own host/filesystem queries; stub it so these
+// tests only pin whether this dialog offers it and with which session.
+vi.mock("./SwitchHostDialog", () => ({
+  SwitchHostDialog: (props: { sessionId: string; currentHostId: string | null }) => (
+    <div
+      data-testid="switch-host-dialog-stub"
+      data-session-id={props.sessionId}
+      data-current-host-id={props.currentHostId ?? ""}
+    />
+  ),
+}));
 
 afterEach(() => {
   cleanup();
@@ -61,7 +72,7 @@ describe("buildReconnectCommand", () => {
       state: "host_offline",
     });
     expect(cmd).toContain("omnigent host");
-    expect(cmd).toContain("--server https://example.databricksapps.com");
+    expect(cmd).toContain("--server 'https://example.databricksapps.com'");
     // The --profile flag was removed from the CLI; emitting it here would
     // hand users a command that errors with "No such option".
     expect(cmd).not.toContain("--profile");
@@ -92,8 +103,32 @@ describe("buildReconnectCommand", () => {
     });
     expect(cmd).toContain("omnigent run path/to/agent.yaml");
     expect(cmd).toContain("--resume conv_abc123");
-    expect(cmd).toContain("--server https://example.databricksapps.com");
+    expect(cmd).toContain("--server 'https://example.databricksapps.com'");
     expect(cmd).not.toContain("--profile");
+  });
+
+  it("quotes server URLs containing shell metacharacters", () => {
+    const cmd = buildReconnectCommand({
+      conversationId: "conv_query",
+      serverUrl: "https://example.com/api?profile=dev&glob=*",
+      state: "host_offline",
+    });
+    expect(cmd).toContain("--server 'https://example.com/api?profile=dev&glob=*'");
+  });
+
+  it("emits `omnigent devin --resume` for a devin-native local_stranded session", () => {
+    // Every native wrapper resumes through its own verb; `omnigent run` cannot
+    // resume one at all, which is what this used to suggest.
+    const cmd = buildReconnectCommand({
+      conversationId: "conv_devin1",
+      serverUrl: "https://x.databricksapps.com",
+      wrapper: "devin-native-ui",
+      state: "local_stranded",
+    });
+    expect(cmd).toContain("omnigent devin");
+    expect(cmd).toContain("--resume conv_devin1");
+    expect(cmd).not.toContain("omnigent run");
+    expect(cmd).not.toContain("path/to/agent.yaml");
   });
 
   it("emits `omnigent claude --resume` for a claude-native local_stranded session", () => {
@@ -119,6 +154,46 @@ describe("buildReconnectCommand", () => {
     });
     expect(cmd).toContain("omnigent run path/to/agent.yaml");
     expect(cmd).not.toContain("omnigent claude");
+  });
+
+  it("resolves the native verb from the harness when there is no wrapper label", () => {
+    // A pre-native session (e.g. a legacy devin-acp row) carries no wrapper
+    // label. The server canonicalizes its harness to `devin-native`, and that
+    // must still pick the right resume verb instead of the generic run form,
+    // which cannot resume a native session.
+    const cmd = buildReconnectCommand({
+      conversationId: "conv_legacy_devin",
+      serverUrl: "https://x.databricksapps.com",
+      wrapper: null,
+      harness: "devin-native",
+      state: "local_stranded",
+    });
+    expect(cmd).toContain("omnigent devin");
+    expect(cmd).toContain("--resume conv_legacy_devin");
+    expect(cmd).not.toContain("omnigent run");
+  });
+
+  it("prefers the wrapper label over the harness when both are present", () => {
+    const cmd = buildReconnectCommand({
+      conversationId: "conv_both",
+      serverUrl: "https://x.databricksapps.com",
+      wrapper: "claude-code-native-ui",
+      harness: "devin-native",
+      state: "local_stranded",
+    });
+    expect(cmd).toContain("omnigent claude");
+    expect(cmd).not.toContain("omnigent devin");
+  });
+
+  it("falls back to the run form when neither wrapper nor harness is native", () => {
+    const cmd = buildReconnectCommand({
+      conversationId: "conv_generic",
+      serverUrl: "https://x.databricksapps.com",
+      wrapper: null,
+      harness: "openai-agents",
+      state: "local_stranded",
+    });
+    expect(cmd).toContain("omnigent run path/to/agent.yaml");
   });
 });
 
@@ -165,6 +240,36 @@ describe("<ReconnectSessionDialog />", () => {
     // The clone form stays mounted (forceMount) but its panel is the
     // inactive one while the Reconnect tab is the default.
     expect(clonePanelState()).toBe("inactive");
+  });
+
+  it("offers the host switch to a host_offline owner and hands off to that dialog", () => {
+    // The composer badge no longer carries a switch link while offline, so
+    // this is the only way to escape a host that isn't coming back.
+    const { onOpenChange } = renderDialog({
+      state: "host_offline",
+      isOwner: true,
+      sourceHostId: "host_dead",
+    });
+    expect(screen.queryByTestId("switch-host-dialog-stub")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("reconnect-session-switch-host"));
+
+    // Handing off means this dialog closes as the switch one opens; the
+    // switch dialog is a sibling, so it survives that close.
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    const stub = screen.getByTestId("switch-host-dialog-stub");
+    expect(stub.getAttribute("data-session-id")).toBe("conv_abc123");
+    expect(stub.getAttribute("data-current-host-id")).toBe("host_dead");
+  });
+
+  it("withholds the host switch from a non-owner and from local_stranded", () => {
+    // Binding a runner on another machine isn't a viewer's call, and a
+    // local_stranded session has no host to move off of.
+    renderDialog({ state: "host_offline", isOwner: false });
+    expect(screen.queryByTestId("reconnect-session-switch-host")).toBeNull();
+    cleanup();
+    renderDialog({ state: "local_stranded", isOwner: true });
+    expect(screen.queryByTestId("reconnect-session-switch-host")).toBeNull();
   });
 
   it("defaults to the Clone tab for a host_offline non-owner", () => {

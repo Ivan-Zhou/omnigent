@@ -381,20 +381,21 @@ class CredentialSourceSpec:
     The secret is resolved in the *parent* (trusted) process and never
     handed to the sandbox verbatim — only a synthetic placeholder is.
 
-    :param kind: Resolution mode, one of ``"env"``, ``"file"``, or
-        ``"command"``.
+    :param kind: Resolution mode: env, file, command, or unix_socket.
     :param env: Environment-variable name carrying the secret when
         ``kind="env"``, e.g. ``"OA_TEST_GITHUB_PAT"``.
-    :param path: File path to read when ``kind="file"`` (``~`` is
-        expanded), e.g. ``"~/.config/tokens/github_pat.txt"``.
+    :param path: File or Unix socket path (``~`` is expanded).
     :param command: Shell command whose stdout is the secret when
         ``kind="command"``, e.g. ``"gh auth token"``.
+    :param refresh_interval_seconds: Re-resolve file or Unix socket sources on
+        access after this interval. ``None`` resolves only at startup.
     """
 
-    kind: Literal["env", "file", "command"]
+    kind: Literal["env", "file", "command", "unix_socket"]
     env: str | None = None
     path: str | None = None
     command: str | None = None
+    refresh_interval_seconds: float | None = None
 
 
 @dataclass
@@ -511,11 +512,12 @@ class OSEnvSandboxSpec:
     """Sandbox configuration for an OS environment."""
 
     # Backend identifier, e.g. ``"linux_bwrap"``,
-    # ``"darwin_seatbelt"``, or ``"none"``. The dataclass default of
-    # ``"linux_bwrap"`` is a safe sentinel for in-process construction
-    # (``OSEnvSandboxSpec(type=self.type_name)`` is the idiomatic call
-    # site); YAML parsers map a missing ``type:`` field to the platform
-    # default at parse time via
+    # ``"darwin_seatbelt"``, or ``"none"``. YAML also accepts ``"auto"``
+    # and resolves it to the platform default before constructing this value.
+    # The dataclass default of ``"linux_bwrap"`` is a safe sentinel for
+    # in-process construction (``OSEnvSandboxSpec(type=self.type_name)`` is
+    # the idiomatic call site); YAML parsers map a missing ``type:`` field to
+    # the platform default at parse time via
     # :func:`omnigent.inner.sandbox._default_sandbox_for_platform`,
     # which picks ``linux_bwrap`` on Linux (with ``bwrap`` on PATH)
     # and ``darwin_seatbelt`` on macOS.
@@ -576,6 +578,9 @@ class OSEnvSandboxSpec:
     # Matching is by basename, so an entry ``".venv"`` allows
     # ``cwd/.venv``,
     # ``cwd/services/api/.venv``, and ``<read_path>/.venv`` alike.
+    # The explicit entry ``"*"`` allows every dotpath while the
+    # escaping-symlink defense remains active. Use it only for trusted
+    # roots whose hidden files must persist across helper invocations.
     # ``None`` means "use the backend's documented default" (both
     # bwrap and seatbelt expand ``None`` to ``[".venv"]`` so a
     # typical Python project keeps working out of the box). An empty
@@ -802,13 +807,6 @@ class TerminalEnvSpec:
         into ``no server running``. Opt-in because it changes the
         ``has-session``-means-alive contract; enabled for the claude-native
         agent terminal (#540), whose liveness is decided by ``#{pane_dead}``.
-    :param terminal_transport: How the web UI attaches to this terminal:
-        ``"control"`` (``tmux -C`` control mode, giving the browser xterm
-        native scrollback + selection — the default) or ``"pty"`` (the legacy
-        forked-``tmux attach`` PTY stream). ``None`` defers to the global
-        default, which is control mode unless ``terminal.transport`` in
-        ``~/.omnigent/config.yaml`` opts out to ``pty``. A per-attach
-        ``?transport=`` query overrides both.
     """
 
     command: str | None = None
@@ -825,7 +823,6 @@ class TerminalEnvSpec:
     tmux_allow_passthrough: bool = False
     tmux_start_on_attach: bool = False
     keep_alive_after_exit: bool = False
-    terminal_transport: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -885,7 +882,7 @@ class AgentDef:
     terminals: dict[str, TerminalEnvSpec] = field(default_factory=dict)
     skills: SkillRegistry = field(default_factory=dict)
     # Materialized agent-bundle root on disk, when known. Used by
-    # the Claude SDK harness to expose ``<bundle>/skills/<name>/
+    # the Claude SDK harness to expose ``<bundle>/skills/<dir>/
     # SKILL.md`` files as plugin skills via the SDK's
     # ``--plugin-dir`` mechanism. Set by the AgentSpec → AgentDef
     # bridge from the spec's parsed ``skill_dir`` paths; left

@@ -8,9 +8,30 @@ from typing import Any
 
 import pytest
 
-from omnigent.claude_model_vocabulary import claude_model_alias
 from omnigent.inner.hook_scripts import claude_router_hook, subagent_router
+from omnigent.models.claude_model_vocabulary import claude_model_alias
 from tests.inner.conftest import advertise_relay_tools, advertise_router
+
+# Gateway model pins that alias resolution reads from the ambient environment.
+_ANTHROPIC_DEFAULT_MODEL_VARS = (
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_anthropic_default_model_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ambient ``ANTHROPIC_DEFAULT_*_MODEL`` pins for every test here.
+
+    ``alias_pins()`` falls back to ``os.environ`` and ``claude_model_alias``
+    returns ``None`` on a *mismatched* pin, so any developer whose shell pins
+    these vars (anyone driving Claude through a gateway) gets no translation and
+    these tests fail spuriously (issue #4279). Tests that need a specific pin set
+    it explicitly after this autouse fixture has cleared the ambient value.
+    """
+    for var in _ANTHROPIC_DEFAULT_MODEL_VARS:
+        monkeypatch.delenv(var, raising=False)
 
 
 def _payload(
@@ -641,11 +662,13 @@ def test_the_spawn_gate_asks_on_the_ladders_own_request_budget(
     # "No opinion": the spawn runs on exactly the model it asked for.
     assert raw == ""
     assert seen == [subagent_router.REQUEST_TIMEOUT_S]
-    assert subagent_router.REQUEST_TIMEOUT_S < 10.0
+    # The budget must outlast a healthy route (catalog prep + router call) and
+    # stay at or under the owner's 15s ceiling.
+    assert subagent_router.REQUEST_TIMEOUT_S <= 15.0
     # The harness's own kill has to sit above it, or the fail-open branch above
     # never runs and the harness sees a dead hook instead of "no opinion".
     assert subagent_router.HOOK_TIMEOUT_S > subagent_router.REQUEST_TIMEOUT_S
-    assert subagent_router.HOOK_TIMEOUT_S <= 15
+    assert subagent_router.HOOK_TIMEOUT_S < 30
 
 
 def test_an_unreachable_relay_is_no_opinion_not_a_dropped_spawn(

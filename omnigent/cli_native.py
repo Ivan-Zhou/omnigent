@@ -25,6 +25,7 @@ from typing import ParamSpec, TypeVar
 
 import click
 
+from omnigent._startup_events import observe_native_startup
 from omnigent._startup_profile import StartupProfiler
 from omnigent.cli_common import (
     CLAUDE_STARTUP_PROFILE_ENV_VAR as _CLAUDE_STARTUP_PROFILE_ENV_VAR,
@@ -35,6 +36,11 @@ from omnigent.cli_common import (
 from omnigent.cli_common import (
     reject_native_on_windows as _reject_native_on_windows,
 )
+
+# Decorator-time vocabulary for ``omnigent devin``'s ``click.Choice`` options.
+# Sourced from the stdlib-only bridge leaf, so importing it here adds no
+# launcher/runner imports to CLI startup.
+from omnigent.harnesses.devin_native.bridge import DEVIN_EFFORTS, DEVIN_PERMISSION_MODES
 
 _Args = ParamSpec("_Args")
 _Return = TypeVar("_Return")
@@ -69,19 +75,17 @@ def register_native_commands(cli: click.Group) -> None:
     _ensure_backend = _late_bound(lambda: _cli._ensure_backend)
     _load_effective_config = _late_bound(lambda: _cli._load_effective_config)
     _reject_reserved_kiro_resume_args = _late_bound(lambda: _cli._reject_reserved_kiro_resume_args)
+    _reject_reserved_devin_resume_args = _late_bound(
+        lambda: _cli._reject_reserved_devin_resume_args
+    )
     _resolve_auto_open_conversation_from_config = _late_bound(
         lambda: _cli._resolve_auto_open_conversation_from_config
     )
     _resolve_harness_startup_args = _late_bound(lambda: _cli._resolve_harness_startup_args)
     _split_resume_value = _late_bound(lambda: _cli._split_resume_value)
+    _reject_smart_routing_prompt = _late_bound(lambda: _cli._reject_smart_routing_prompt)
     _reject_smart_routing_resume = _late_bound(lambda: _cli._reject_smart_routing_resume)
-    _require_smart_routing_prompt = _late_bound(lambda: _cli._require_smart_routing_prompt)
     _smart_routing_decision = _late_bound(lambda: _cli._smart_routing_decision)
-    _with_routed_model_arg = _late_bound(lambda: _cli._with_routed_model_arg)
-
-    from omnigent.runner.turn_routing import (
-        supports_in_harness_turn_routing as _supports_in_harness_turn_routing,
-    )
 
     @cli.command(
         context_settings={
@@ -175,11 +179,12 @@ def register_native_commands(cli: click.Group) -> None:
         is_flag=True,
         default=False,
         help=(
-            "Let the server pick the model for this launch. With -p the pick "
-            "happens up front; without it, your first typed message picks it."
+            "Let the server pick the model for this session. The first message "
+            "you type in the TUI is what gets routed, so this takes no -p."
         ),
     )
     @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
+    @observe_native_startup("claude-native")
     def claude(
         server: str | None,
         resume: str | None,
@@ -200,7 +205,8 @@ def register_native_commands(cli: click.Group) -> None:
         #     existing Claude config.
         # :param profile_startup: When True, print startup timing marks.
         # :param prompt: Optional initial TUI prompt.
-        # :param smart_routing: When True, route the model from ``prompt``.
+        # :param smart_routing: When True, arm Smart Routing for the session so
+        #     the first typed message picks the model.
         # :param claude_args: Pass-through args for ``claude``.
         """Launch Claude Code with Omnigent.
 
@@ -210,17 +216,13 @@ def register_native_commands(cli: click.Group) -> None:
           omnigent claude --resume conv_abc123
           omnigent claude --resume                  # interactive picker
           omnigent claude --server https://<app>.databricksapps.com
-          omnigent claude --smart-routing -p "fix the flaky test"
+          omnigent claude --smart-routing           # first message picks the model
         """
         _reject_native_on_windows("claude")
         if smart_routing:
             # Validate before any side effects (daemon spawn, server discovery)
-            # so an unroutable invocation fails instantly. This harness hooks
-            # its own first prompt, so a bare launch routes on what gets typed.
-            prompt = _require_smart_routing_prompt(
-                prompt,
-                in_harness_routing=_supports_in_harness_turn_routing("claude-native"),
-            )
+            # so an unroutable invocation fails instantly.
+            _reject_smart_routing_prompt(prompt)
         startup_profiler = StartupProfiler.from_env(
             name="omnigent claude",
             env_var=_CLAUDE_STARTUP_PROFILE_ENV_VAR,
@@ -269,8 +271,8 @@ def register_native_commands(cli: click.Group) -> None:
             choice.conversation_id if choice.conversation_id is not None else session_id
         )
 
-        from omnigent.claude_native import run_claude_native
         from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.claude_native.main import run_claude_native
 
         startup_profiler.mark("native module imported")
 
@@ -287,16 +289,18 @@ def register_native_commands(cli: click.Group) -> None:
             explicit=claude_command,
             cfg=cfg,
         )
-        extra_args = _resolve_harness_startup_args(cfg, "claude-native", claude_args)
+        # The daemon runner is the single merge point for harness.<id>.args on
+        # the native claude/codex terminal (_auto_create_*_terminal resolves
+        # them), and every CLI launch here reaches that daemon path. Persist the
+        # RAW pass-through so the runner merge is not stacked on top of a
+        # CLI-merged prefix — that doubled the wrapper (e.g. `isaac -- -- …`).
+        extra_args = claude_args
         if smart_routing:
-            # Routing creates the session (that is where the model is picked and
-            # the decision card is written), so attach to it instead of letting
-            # the wrapper bundle a fresh one.
-            decision = _smart_routing_decision(
-                server=server, prompt=prompt, harness="claude-native"
-            )
-            extra_args = _with_routed_model_arg(extra_args, decision.model)
-            resolved_session_id = decision.session_id or resolved_session_id
+            # Arming creates the session (that is where Smart Routing is turned
+            # on and the decision card lands), so attach to it instead of
+            # letting the wrapper bundle a fresh one.
+            armed = _smart_routing_decision(server=server, harness="claude-native")
+            resolved_session_id = armed.session_id or resolved_session_id
         run_claude_native(
             server=server,
             session_id=resolved_session_id,
@@ -360,11 +364,12 @@ def register_native_commands(cli: click.Group) -> None:
         is_flag=True,
         default=False,
         help=(
-            "Let the server pick the model for this launch. With -p the pick "
-            "happens up front; without it, your first typed message picks it."
+            "Let the server pick the model for this session. The first message "
+            "you type in the TUI is what gets routed, so this takes no -p."
         ),
     )
     @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
+    @observe_native_startup("codex-native")
     def codex(
         server: str | None,
         resume: str | None,
@@ -380,7 +385,8 @@ def register_native_commands(cli: click.Group) -> None:
         # :param session_id: Legacy ``--session`` id; mutually exclusive with ``--resume``.
         # :param model: Codex model id.
         # :param prompt: Optional first prompt.
-        # :param smart_routing: When True, route the model from ``prompt``.
+        # :param smart_routing: When True, arm Smart Routing for the session so
+        #     the first typed message picks the model.
         # :param codex_args: Pass-through args for ``codex`` before ``resume``.
         """Launch Codex with Omnigent.
 
@@ -390,19 +396,13 @@ def register_native_commands(cli: click.Group) -> None:
           omnigent codex --resume conv_abc123
           omnigent codex --resume                  # interactive picker
           omnigent codex --server https://<app>.databricksapps.com
-          omnigent codex --smart-routing -p "fix the flaky test"
+          omnigent codex --smart-routing           # first message picks the model
         """
         _reject_native_on_windows("codex")
-        model_source = click.get_current_context().get_parameter_source("model")
-        model_from_cli = model_source is click.core.ParameterSource.COMMANDLINE
         if smart_routing:
             # Validate before any side effects (daemon spawn, server discovery)
-            # so an unroutable invocation fails instantly. This harness hooks
-            # its own first prompt, so a bare launch routes on what gets typed.
-            prompt = _require_smart_routing_prompt(
-                prompt,
-                in_harness_routing=_supports_in_harness_turn_routing("codex-native"),
-            )
+            # so an unroutable invocation fails instantly.
+            _reject_smart_routing_prompt(prompt)
         choice = _split_resume_value(resume)
         if session_id is not None and (choice.picker or choice.conversation_id is not None):
             raise click.UsageError(
@@ -416,8 +416,8 @@ def register_native_commands(cli: click.Group) -> None:
                 or session_id is not None
             )
 
-        from omnigent.codex_native import run_codex_native
         from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.codex_native.main import run_codex_native
 
         cfg = _load_effective_config()
         if server is None:
@@ -443,21 +443,16 @@ def register_native_commands(cli: click.Group) -> None:
             cfg=cfg,
         )
         if smart_routing:
-            decision = _smart_routing_decision(
-                server=server, prompt=prompt, harness="codex-native"
-            )
-            # Codex takes the model first-class. A routed model beats the
-            # configured default (the user asked to route) but never an
-            # explicit ``--model``.
-            if decision.model is not None and not model_from_cli:
-                model = decision.model
-            # Attach to the routed session — routing created it.
-            resolved_session_id = decision.session_id or resolved_session_id
+            # Attach to the armed session — arming created it. Nothing is picked
+            # yet, so ``model`` keeps whatever the user or config asked for
+            # until the first typed message routes.
+            armed = _smart_routing_decision(server=server, harness="codex-native")
+            resolved_session_id = armed.session_id or resolved_session_id
         run_codex_native(
             server=server,
             session_id=resolved_session_id,
             resume_picker=choice.picker,
-            extra_args=_resolve_harness_startup_args(cfg, "codex-native", codex_args),
+            extra_args=codex_args,  # raw; runner is the sole arg-merge point (see claude)
             model=model,
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
@@ -529,7 +524,7 @@ def register_native_commands(cli: click.Group) -> None:
           omnigent opencode --resume                  # interactive picker
           omnigent opencode --server https://<app>.databricksapps.com
         """
-        from omnigent.opencode_native import run_opencode_native
+        from omnigent.harnesses.opencode_native.main import run_opencode_native
 
         cfg = _load_effective_config()
         if server is None:
@@ -628,7 +623,7 @@ def register_native_commands(cli: click.Group) -> None:
             )
 
         from omnigent.harness_startup_config import resolve_harness_command
-        from omnigent.pi_native import run_pi_native
+        from omnigent.harnesses.pi_native.main import run_pi_native
 
         cfg = _load_effective_config()
         # Thread ``harness.pi-native.command`` config into the runner via the
@@ -739,8 +734,8 @@ def register_native_commands(cli: click.Group) -> None:
                 "prefer --resume (--session is deprecated).",
             )
 
-        from omnigent.cursor_native import run_cursor_native
         from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.cursor_native.main import run_cursor_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.cursor-native.command`` config into the
@@ -771,6 +766,145 @@ def register_native_commands(cli: click.Group) -> None:
             model=model,
             auto_open_conversation=auto_open_conversation,
             mode=mode,
+        )
+
+    @cli.command(
+        context_settings={
+            "ignore_unknown_options": True,
+            "allow_extra_args": True,
+        }
+    )
+    @click.option(
+        "--server",
+        default=None,
+        help=(
+            "Remote omnigent URL. Ensures the host daemon, asks the "
+            "daemon-spawned runner to launch the Devin TUI, and attaches this TTY. "
+            'Pass --server "" to auto-spawn a persistent local server in the '
+            "background and use that instead of a remote one."
+        ),
+    )
+    @click.option(
+        "-r",
+        "--resume",
+        "resume",
+        is_flag=False,
+        flag_value=_RESUME_PICKER_SENTINEL,
+        default=None,
+        help=(
+            "Resume a prior Omnigent conversation. With a conversation id "
+            "(e.g. ``--resume conv_abc123``) attaches directly; with no value "
+            "opens an interactive picker scoped to devin-native sessions."
+        ),
+    )
+    @click.option(
+        "--session",
+        "session_id",
+        metavar="SESSION_ID",
+        default=None,
+        hidden=True,
+        help="Deprecated alias for ``--resume <id>``; kept for one release.",
+    )
+    @click.option(
+        "--model",
+        default=None,
+        help=(
+            "Devin model for the native chat — any family slug or alias from "
+            "`devin models list` (e.g. ``opus``, ``gpt``, ``swe``). Combined with "
+            "--effort into Devin's variant id."
+        ),
+    )
+    @click.option(
+        "--effort",
+        default=None,
+        type=click.Choice(DEVIN_EFFORTS),
+        help=(
+            "Reasoning effort. Devin encodes effort as a model-variant suffix, so "
+            "this is composed onto --model (family + rung) rather than sent as its "
+            "own flag. Ignored when the chosen family has no such rung."
+        ),
+    )
+    @click.option(
+        "--permission-mode",
+        "permission_mode",
+        default=None,
+        type=click.Choice(DEVIN_PERMISSION_MODES),
+        help="Devin permission mode for this launch.",
+    )
+    @click.option(
+        "--sandbox",
+        is_flag=True,
+        default=False,
+        help="Enable Devin's OS-level process sandbox for its exec tool.",
+    )
+    @click.option(
+        "-p",
+        "--prompt",
+        default=None,
+        help="Send this as the initial Devin chat input when the TUI starts.",
+    )
+    @click.argument("devin_args", nargs=-1, type=click.UNPROCESSED)
+    def devin(
+        server: str | None,
+        resume: str | None,
+        session_id: str | None,
+        model: str | None,
+        effort: str | None,
+        permission_mode: str | None,
+        sandbox: bool,
+        prompt: str | None,
+        devin_args: tuple[str, ...],
+    ) -> None:
+        """Launch Devin with Omnigent.
+
+        \b
+        Examples:
+          omnigent devin
+          omnigent devin --resume conv_abc123
+          omnigent devin --resume                       # interactive picker
+          omnigent devin --model opus --effort xhigh
+          omnigent devin --permission-mode smart -p "review this repo"
+        """
+        choice = _split_resume_value(resume)
+        if session_id is not None and (choice.picker or choice.conversation_id is not None):
+            raise click.UsageError(
+                "--session and --resume are mutually exclusive; "
+                "prefer --resume (--session is deprecated).",
+            )
+        _reject_reserved_devin_resume_args(devin_args)
+
+        from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.devin_native.main import run_devin_native
+
+        cfg = _load_effective_config()
+        # Thread ``--command`` / ``harness.devin-native.command`` config into the
+        # runner via the canonical ``OMNIGENT_DEVIN_PATH`` env var (set before
+        # ``_ensure_backend`` so a locally-spawned daemon inherits it).
+        _resolved = resolve_harness_command("devin-native", default="", explicit=None, cfg=cfg)
+        if _resolved:
+            os.environ["OMNIGENT_DEVIN_PATH"] = _resolved
+        if server is None:
+            server = cfg.get("server")
+        if model is None:
+            model = cfg.get("model")
+        auto_open_conversation = _resolve_auto_open_conversation_from_config(cfg)
+
+        server = _ensure_backend(server)
+        resolved_session_id = (
+            choice.conversation_id if choice.conversation_id is not None else session_id
+        )
+
+        run_devin_native(
+            server=server,
+            session_id=resolved_session_id,
+            resume_picker=choice.picker,
+            extra_args=_resolve_harness_startup_args(cfg, "devin-native", devin_args),
+            model=model,
+            effort=effort,
+            permission_mode=permission_mode,
+            sandbox=sandbox,
+            prompt=prompt,
+            auto_open_conversation=auto_open_conversation,
         )
 
     @cli.command(
@@ -865,7 +999,7 @@ def register_native_commands(cli: click.Group) -> None:
         _reject_reserved_kiro_resume_args(kiro_args)
 
         from omnigent.harness_startup_config import resolve_harness_command
-        from omnigent.kiro_native import run_kiro_native
+        from omnigent.harnesses.kiro_native.main import run_kiro_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.kiro-native.command`` config into the
@@ -962,8 +1096,8 @@ def register_native_commands(cli: click.Group) -> None:
                 "prefer --resume (--session is deprecated).",
             )
 
-        from omnigent.goose_native import run_goose_native
         from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.goose_native.main import run_goose_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.goose-native.command`` config into the
@@ -1050,7 +1184,7 @@ def register_native_commands(cli: click.Group) -> None:
             )
 
         from omnigent.harness_startup_config import resolve_harness_command
-        from omnigent.hermes_native import run_hermes_native
+        from omnigent.harnesses.hermes_native.main import run_hermes_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.hermes-native.command`` config into the
@@ -1127,10 +1261,10 @@ def register_native_commands(cli: click.Group) -> None:
 
         \b
         Examples:
-          omnigent antigravity
-          omnigent antigravity --resume conv_abc123
-          omnigent antigravity --resume                  # interactive picker
-          omnigent antigravity --server https://<app>.databricksapps.com
+          omni agy
+          omni agy --resume conv_abc123
+          omni agy --resume                  # interactive picker
+          omni agy --server https://<app>.databricksapps.com
         """
         # Validate option combinations BEFORE any side effects (daemon spawn,
         # server discovery) -- see the same comment in the claude command.
@@ -1141,8 +1275,8 @@ def register_native_commands(cli: click.Group) -> None:
                 "prefer --resume (--session is deprecated).",
             )
 
-        from omnigent.antigravity_native import run_antigravity_native
         from omnigent.harness_startup_config import resolve_harness_command
+        from omnigent.harnesses.antigravity_native.main import run_antigravity_native
 
         cfg = _load_effective_config()
         if server is None:
@@ -1177,6 +1311,9 @@ def register_native_commands(cli: click.Group) -> None:
             auto_open_conversation=auto_open_conversation,
             command=resolved_command or None,
         )
+
+    # Register ``agy`` CLI shortcut for parity with the upstream binary name.
+    cli.add_command(antigravity, name="agy")
 
     @cli.command(
         context_settings={
@@ -1238,7 +1375,7 @@ def register_native_commands(cli: click.Group) -> None:
             )
 
         from omnigent.harness_startup_config import resolve_harness_command
-        from omnigent.qwen_native import run_qwen_native
+        from omnigent.harnesses.qwen_native.main import run_qwen_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.qwen-native.command`` config into the
@@ -1334,7 +1471,7 @@ def register_native_commands(cli: click.Group) -> None:
             )
 
         from omnigent.harness_startup_config import resolve_harness_command
-        from omnigent.kimi_native import run_kimi_native
+        from omnigent.harnesses.kimi_native.main import run_kimi_native
 
         cfg = _load_effective_config()
         # Thread ``--command`` / ``harness.kimi-native.command`` config into the

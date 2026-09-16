@@ -6,6 +6,87 @@ welcome. For larger changes, open an issue first so we can discuss the approach.
 Please don't include secrets, internal URLs, customer data, or private
 configuration in issues, tests, examples, or logs.
 
+## Issue prioritization
+
+We rank open community issues so maintainers see the most important work first.
+The ranking is a triage aid, not a delivery promise or roadmap commitment.
+
+An LLM reads the issue title, body, and labels and classifies its type, severity,
+and affected areas. It does not assign the final priority directly. Priority
+comes from deterministic arithmetic:
+
+The issue template provides an initial type, but automation may correct the
+`Bug`, `Feature`, or `Docs` label when the issue content indicates a different
+type. For example, a feature request that describes broken existing behavior is
+reclassified as a bug and follows the bug-report evidence requirements below.
+
+```text
+score = severity points × component weight + community-demand points
+```
+
+| Signal | Current treatment |
+| --- | --- |
+| Severity | S0=100, S1=60, S2=30, S3=10. It captures impact and reach. |
+| Component | The highest matching area weight, currently 0.9–1.4. |
+| Community demand | GitHub `+1` reactions add up to 15 points, capped at 12 reactions. |
+| Needs information | An issue labeled `needs-info` scores zero until the missing information arrives. |
+
+Scores map to priority labels as follows:
+
+| Priority | Score |
+| --- | ---: |
+| `P0-critical` | 100 or higher |
+| `P1-high` | 60–99.99 |
+| `P2-medium` | 25–59.99 |
+| `P3-low` | Below 25 |
+
+Age, readiness, and duplicate-count adjustments are not currently enabled.
+Component importance is a separate signal, so severity is not raised merely
+because an issue affects a particular harness or subsystem.
+
+Maintainers can correct severity, component, or priority labels when context is
+missing from the model. Automation preserves those overrides and does not
+replace a maintainer-set priority with its own proposal. The queue is rerun as
+issues change, while unchanged LLM classifications are reused.
+
+For bugs, include the observed impact, reproduction evidence, Omnigent version,
+platform, and affected harness or authentication mode. Direct steps are best,
+but a clear intermittent observation, controlled test, diagnostics, or concrete
+analysis of the failing code path can also give maintainers enough to
+investigate. For feature requests, describe the user problem and expected
+reach. Use a `+1` reaction when an existing issue matters to you; ordinary
+comments are not counted as votes.
+
+The scoring configuration and component map are public in
+[`default_scoring.json`](.github/triage_v2/src/issue_prioritization/default_scoring.json)
+and [`areas.json`](.github/areas.json).
+
+## Response times and inactive issues
+
+Priority determines the order in which maintainers consider work; it does not
+set a response, review, or resolution deadline. We are working toward published
+response targets, but they are not yet an SLA. For now, we do not guarantee a
+specific response time for issues or pull requests.
+
+Issues with no activity for 30 days are marked `stale` and close after another
+14 days without activity. New activity restarts that inactivity window. Issues
+labeled `pinned`, `security`, or `bug` are exempt.
+
+If a bug is labeled `needs-info`, the automation asks its author for the
+specific missing information and gives them 7 days to respond. An author reply
+triggers another triage pass; the label clears only when the new information is
+actionable. A reply that still does not provide enough evidence does not reset
+the original deadline.
+
+If the requested information is still missing when the deadline passes, the
+issue is automatically closed as not planned. A later author reply reopens the
+issue and sends it through triage again. This lifecycle is separate from the
+normal stale policy and applies to bug reports that would otherwise be exempt
+from stale closure.
+
+Pull requests waiting for an author response follow the separate 7-day policy
+described under [Review state labels](#review-state-labels).
+
 ## Development setup
 
 This is a Python package with an optional frontend under `web/`. Use
@@ -38,19 +119,23 @@ cd omnigent
 
 uv python install
 uv venv --python "$(cat .python-version)"
-uv sync --extra all --extra dev
+uv sync --extra all --group dev
 source .venv/bin/activate    # or prefix commands with `uv run`
 ```
+
+Repository-only dependencies use PEP 735 groups: `lint` for static checks and
+code generation, `test` for pytest, and `dev` for both. Product capabilities
+remain installable extras. Plain `uv sync` installs neither group by default.
 
 Common checks:
 
 Pyrefly is the canonical Python type checker for the repository.
 
 ```bash
-uv run pytest                      # Python tests (e2e/live skipped by default)
-uv run ruff check . && uv run ruff format --check .
-uv run --no-sync pyrefly check     # Python type checking (core and client SDK)
-uv run pre-commit run --all-files
+uv run --no-sync pytest                      # Python tests (e2e/live skipped by default)
+uv run --no-sync ruff check . && uv run --no-sync ruff format --check .
+uv run --no-sync pyrefly check               # Python type checking (core and client SDK)
+uv run --no-sync pre-commit run --all-files
 ```
 
 When touching `web/`:
@@ -88,7 +173,7 @@ test. A fresh worktree needs its own Python environment first:
 
 ```bash
 cd /path/to/omnigent-worktree
-uv sync --extra all --extra dev
+uv sync --extra all --group dev
 omnidev
 ```
 
@@ -259,7 +344,8 @@ request enforces this, so unsigned commits will block merging.
 - Sign off your commits with `git commit -s` (see
   [Developer Certificate of Origin](#developer-certificate-of-origin) above).
 - **Reference an issue** (see below).
-- Fill in the PR template. For **UI / frontend changes**, check the
+- Fill in the PR template. Bug fixes and features should include reproducible
+  evidence in the Demo or Test Plan. For **UI / frontend changes**, check the
   "UI / frontend change" box and attach a **video or images** in the `Demo`
   section showing the new behaviour, so reviewers can see it without checking
   out the branch.
@@ -298,7 +384,12 @@ your PR is, check that box under *Type of change* and no issue is needed.
 Anything that fixes a bug, adds a feature, or changes the UI needs an issue,
 even when it also touches docs or tests.
 
-A bot comments once on PRs that reference no issue. It never closes anything.
+A bot comments once on PRs that reference no issue and labels them `needs-issue`.
+Reference an issue and the label clears automatically. A PR still labeled
+`needs-issue` after **7 days** is closed, the same way and for the same reason as
+`waiting-on-author` below: to keep the review queue readable, not as a judgement
+on the change. It is reversible, so comment `/reopen` once you have added the
+reference.
 
 ### Review state labels
 
@@ -309,6 +400,10 @@ need to apply them.
 | --- | --- |
 | `waiting-on-author` | A maintainer has left feedback. The PR is in your court. |
 | `waiting-for-review` | You have responded. It is back in the reviewer's queue. |
+
+A third label, `needs-issue`, is separate from these two: it says the PR
+references no issue, not that anyone is waiting on a reply. See [Every PR needs an
+issue](#every-pr-needs-an-issue).
 
 A maintainer reviewing or commenting on your PR sets `waiting-on-author`. When
 you push a commit, comment, or reply to a review, that clears automatically and

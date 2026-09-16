@@ -21,12 +21,13 @@ from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
-from omnigent.json_types import JsonValue
 from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
 )
+from omnigent.util.json_types import JsonValue
 
+from .agent_env import strip_desktop_session_env
 from .async_utils import run_sync_on_thread
 from .credential_proxy import (
     CredentialProxyRuntime,
@@ -42,8 +43,9 @@ from .sandbox import (
     cleanup_private_tmpdir,
     create_private_tmpdir,
     get_backend,
+    reachable_roots,
     resolve_sandbox,
-    set_temp_env,
+    set_sandbox_env,
     with_additional_write_roots,
 )
 
@@ -97,8 +99,13 @@ class _PopenKwargs(TypedDict, total=False):
 #   non-interactive startup.
 # - ``PROMPT_COMMAND``: arbitrary command run by bash before each prompt.
 # - ``CDPATH``: changes the resolution of relative paths in shell ``cd``.
-# - ``SSH_AUTH_SOCK``: the user's running ssh-agent socket — a
-#   credential surface masquerading as a path.
+# - ``SSH_AUTH_SOCK``: the user's ssh-agent socket. Allowed through the
+#   weaker host→runner and harness-CLI boundaries (a socket path, like
+#   ``KUBECONFIG``), but an ACTIVE sandbox is where the agent is being
+#   deliberately confined, and signing with the user's keys is exactly
+#   what that confinement is for. Opt in per-spec, and grant the socket
+#   path too: under seatbelt / bwrap the name alone points at something
+#   unreachable.
 # - ``DBUS_SESSION_BUS_ADDRESS``: lets the helper talk to the user's
 #   D-Bus session.
 # - ``XDG_RUNTIME_DIR``: per-session socket directory (Wayland, ssh-
@@ -107,7 +114,7 @@ class _PopenKwargs(TypedDict, total=False):
 #   include the project root; passing through the parent's value would
 #   let any ambient ``PYTHONPATH`` shadow our setting.
 # - ``TMPDIR`` / ``TMP`` / ``TEMP`` / ``TEMPDIR``: set explicitly by
-#   :func:`set_temp_env` to point at the per-helper scratch tmpdir.
+#   :func:`set_sandbox_env` to point at the per-helper scratch tmpdir.
 # - All credential families: ``AWS_*``, ``GITHUB_TOKEN``,
 #   ``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``, ``DATABRICKS_TOKEN``,
 #   ``GOOGLE_APPLICATION_CREDENTIALS``, ``VAULT_TOKEN``, ``KUBECONFIG``,
@@ -196,6 +203,8 @@ def build_helper_env(
     behavior can pass ``sandbox.type: none`` (which opts out of every
     sandboxing protection, env filtering included).
 
+    Active sandboxes also exclude host desktop-session variables, even when
+    declared in passthrough; launch supplies a private ``XDG_RUNTIME_DIR``.
     Both branches always strip the runner-auth secret
     (:data:`~omnigent.runner.identity.RUNNER_AUTH_SECRET_ENV_VARS`): the
     helper runs the agent's tool payload, which must never see the tunnel
@@ -211,7 +220,7 @@ def build_helper_env(
     :returns: A fresh dict containing only the allowed env vars (minus
         runner-auth secrets), ready to hand to ``subprocess.Popen``'s
         ``env=`` argument. Callers typically follow up with
-        ``set_temp_env`` and an explicit ``PYTHONPATH`` write so those
+        ``set_sandbox_env`` and an explicit ``PYTHONPATH`` write so those
         values take precedence over anything the parent might have set.
     """
     if not sandbox.active:
@@ -226,7 +235,7 @@ def build_helper_env(
     prefixes = _DEFAULT_ENV_PASSTHROUGH_PREFIXES
 
     env: dict[str, str] = {}
-    for name, value in parent_env.items():
+    for name, value in strip_desktop_session_env(parent_env).items():
         if name in allowed or any(name.startswith(prefix) for prefix in prefixes):
             env[name] = value
     # The default allowlist already excludes the runner-auth secrets,
@@ -456,7 +465,7 @@ class _HelperProcessClient:
         if sandbox.active:
             self._tmpdir = create_private_tmpdir()
             sandbox = with_additional_write_roots(sandbox, [self._tmpdir])
-            set_temp_env(env, self._tmpdir)
+            set_sandbox_env(env, self._tmpdir)
             if self.start_in_scratch:
                 helper_cwd = self._tmpdir
                 env["PWD"] = str(self._tmpdir)
@@ -475,6 +484,8 @@ class _HelperProcessClient:
                 credential_runtime = prepare_credential_proxy_runtime(
                     sandbox.credential_proxy,
                     parent_env=credential_parent_env,
+                    sandbox=sandbox,
+                    cwd=self.cwd,
                 )
                 env.update(credential_runtime.helper_env_updates)
                 # Materialize placeholder-only config files (e.g. a
@@ -495,6 +506,9 @@ class _HelperProcessClient:
                     credential_runtime.rewrites if credential_runtime is not None else None
                 ),
             )
+
+        if self._tmpdir is not None:
+            set_sandbox_env(env, self._tmpdir)
 
         config: dict[str, JsonValue] = {
             "cwd": str(helper_cwd),
@@ -991,7 +1005,7 @@ def _handle_helper_request(
         path = _resolve_path(cwd, raw_path)
         try:
             _assert_within_reach(cwd, sandbox, path, need_write=False)
-            _assert_read_allowed(sandbox, path)
+            _assert_read_allowed(sandbox, path, cwd)
         except PermissionError as exc:
             return {"error": str(exc)}
         offset_raw = request.get("offset", 1)
@@ -1033,7 +1047,7 @@ def _handle_helper_request(
         path = _resolve_path(cwd, raw_path)
         try:
             _assert_within_reach(cwd, sandbox, path, need_write=True)
-            _assert_read_allowed(sandbox, path)
+            _assert_read_allowed(sandbox, path, cwd)
             _assert_write_allowed(sandbox, path)
         except PermissionError as exc:
             return {"error": str(exc)}
@@ -1113,6 +1127,9 @@ def _assert_within_reach(
     """Confine a file-tool op to *cwd*, extended by declared sandbox grants.
 
     Replaces the historical cwd-only guard at the read / write / edit sites.
+    The grants come from :func:`omnigent.inner.sandbox.reachable_roots`, which
+    is also what the filesystem APIs advertise as reachable, so what is
+    enforced here and what a caller is told it can reach cannot drift apart.
     *resolved* is already canonicalised by :func:`_resolve_path` (symlinks
     followed, ``..`` collapsed) and every grant root is canonicalised at
     resolve time, so a symlink or ``..`` chain whose real target leaves both
@@ -1159,18 +1176,13 @@ def _assert_within_reach(
     :raises PermissionError: If *resolved* is outside *cwd* and no grant of
         the required kind covers it.
     """
-    resolved_cwd = cwd.resolve()
-    if _is_within(resolved, resolved_cwd):
-        return
-    # Write grants (directories + single files) admit both reads and writes.
-    if any(_is_within(resolved, root) for root in policy.write_roots):
-        return
-    if any(resolved == grant for grant in policy.write_files):
-        return
-    # Read grants admit reads only.
-    if not need_write and policy.read_roots is not None:
-        if any(_is_within(resolved, root) for root in policy.read_roots):
+    for root in reachable_roots(cwd, policy):
+        # Read grants admit reads only; write grants admit both.
+        if need_write and root.access != "write":
+            continue
+        if root.contains(resolved):
             return
+    resolved_cwd = cwd.resolve()
     kind = "write" if need_write else "read"
     raise PermissionError(
         f"Access to '{resolved}' is blocked: path is outside the "
@@ -1179,11 +1191,15 @@ def _assert_within_reach(
     )
 
 
-def _assert_read_allowed(policy: SandboxPolicy, path: Path) -> None:
+def _assert_read_allowed(policy: SandboxPolicy, path: Path, cwd: Path) -> None:
     roots = policy.read_roots
     if not policy.active or roots is None:
         return
-    if any(_is_within(path, root) for root in roots):
+    if _is_within(path, cwd):
+        return
+    if any(_is_within(path, root) for root in (*roots, *policy.write_roots)):
+        return
+    if any(path == allowed for allowed in policy.write_files):
         return
     raise PermissionError(f"Read access to '{path}' is blocked by sandbox.")
 

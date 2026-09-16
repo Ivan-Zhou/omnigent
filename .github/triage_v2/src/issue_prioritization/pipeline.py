@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -7,7 +8,11 @@ from typing import Protocol
 
 from issue_prioritization.artifacts import RankedIssue, rank_issues
 from issue_prioritization.bronze import BronzeIssue
-from issue_prioritization.classification import Classification, Classifier
+from issue_prioritization.classification import (
+    Classification,
+    Classifier,
+    reported_issue_type,
+)
 from issue_prioritization.mutations import MutationPlan, MutationPlanner
 from issue_prioritization.scoring import ScoreEngine
 
@@ -40,6 +45,12 @@ class MutationSink(Protocol):
 
 
 @dataclass(frozen=True)
+class ClassificationFailure:
+    issue_number: int
+    reason: str
+
+
+@dataclass(frozen=True)
 class PipelineRun:
     run_id: str
     mode: PipelineMode
@@ -50,6 +61,7 @@ class PipelineRun:
     regrade: bool = False
     adopt_legacy_bot_priorities: bool = False
     legacy_priorities_adopted: int = 0
+    classification_failures: tuple[ClassificationFailure, ...] = ()
 
 
 class IssuePrioritizationPipeline:
@@ -61,9 +73,9 @@ class IssuePrioritizationPipeline:
         scores: ScoreSink,
         artifacts: ArtifactSink,
         engine: ScoreEngine,
-        maintainers: set[str],
         mutation_planner: MutationPlanner | None = None,
         mutation_sink: MutationSink | None = None,
+        classification_progress: Callable[[int, int], None] | None = None,
     ) -> None:
         self.source = source
         self.classifier = classifier
@@ -71,9 +83,9 @@ class IssuePrioritizationPipeline:
         self.scores = scores
         self.artifacts = artifacts
         self.engine = engine
-        self.maintainers = maintainers
         self.mutation_planner = mutation_planner
         self.mutation_sink = mutation_sink
+        self.classification_progress = classification_progress
 
     def run(
         self,
@@ -83,22 +95,45 @@ class IssuePrioritizationPipeline:
         adopt_legacy_bot_priorities: bool = False,
     ) -> PipelineRun:
         now = datetime.now(UTC)
-        issues = [
-            issue
-            for issue in self.source.load_open_issues()
-            if issue.author.lower() not in self.maintainers
-        ]
+        issues = self.source.load_open_issues()
         existing = self.classifications.load()
+        contents = {issue.number: issue.content() for issue in issues}
+        refresh = {
+            issue.number
+            for issue in issues
+            if regrade
+            or not (cached := existing.get(issue.number))
+            or cached.content_hash != contents[issue.number].content_hash
+        }
+        if self.classification_progress:
+            self.classification_progress(0, len(refresh))
         resolved: dict[int, Classification] = {}
         updated = []
+        failures = []
+        attempted = 0
         for issue in issues:
             cached = existing.get(issue.number)
-            if not regrade and cached and cached.content_hash == issue.content().content_hash:
-                resolved[issue.number] = cached
+            submitted_type = reported_issue_type(contents[issue.number].labels)
+            if issue.number not in refresh and cached:
+                classification = replace(cached, reported_type=submitted_type)
+                resolved[issue.number] = classification
+                if classification != cached:
+                    updated.append(classification)
                 continue
-            classification = self.classifier.classify(issue.content())
+            try:
+                classification = self.classifier.classify(contents[issue.number])
+            except ValueError as error:
+                failures.append(ClassificationFailure(issue.number, _failure_reason(error)))
+                attempted += 1
+                if self.classification_progress:
+                    self.classification_progress(attempted, len(refresh))
+                continue
+            classification = replace(classification, reported_type=submitted_type)
             resolved[issue.number] = classification
             updated.append(classification)
+            attempted += 1
+            if self.classification_progress:
+                self.classification_progress(attempted, len(refresh))
         if updated:
             self.classifications.upsert(updated)
 
@@ -119,14 +154,9 @@ class IssuePrioritizationPipeline:
             }
         normalized = []
         for issue in issues:
+            if issue.number not in resolved:
+                continue
             normalized_issue = issue.to_issue(resolved[issue.number], now)
-            if self.mutation_planner:
-                severity = self.mutation_planner.severity_override(
-                    issue.labels,
-                    bot_states.get(issue.number),
-                )
-                if severity is not None:
-                    normalized_issue = replace(normalized_issue, severity=severity)
             normalized.append(normalized_issue)
         ranked = tuple(rank_issues(normalized, self.engine))
         current_labels = {issue.number: issue.labels for issue in issues}
@@ -145,6 +175,7 @@ class IssuePrioritizationPipeline:
             regrade=regrade,
             adopt_legacy_bot_priorities=adopt_legacy_bot_priorities,
             legacy_priorities_adopted=len(set(bot_states) - set(persisted_bot_states)),
+            classification_failures=tuple(failures),
         )
         self.artifacts.write(run)
         self.scores.write(run)
@@ -153,3 +184,7 @@ class IssuePrioritizationPipeline:
                 raise RuntimeError("apply mode requires a mutation sink")
             self.mutation_sink.apply(run)
         return run
+
+
+def _failure_reason(error: ValueError) -> str:
+    return " ".join(str(error).split())[:500]

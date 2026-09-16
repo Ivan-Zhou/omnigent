@@ -17,7 +17,9 @@ the same reason: the e2e_ui harness's tunneled runner registers no *host* and
 the host filesystem endpoint has nothing to browse, so ``/v1/hosts``,
 ``/v1/agents``, the project config, and the create ``POST`` are faked (the POST
 handler *captures the body* — the thing under test — and returns a real seeded
-session id so post-send navigation lands somewhere real).
+session id so post-send navigation lands somewhere real). Default precedence
+and worktree request variants are covered in
+``web/src/shell/NewChatDialog.projectPrefill.test.tsx``.
 """
 
 from __future__ import annotations
@@ -208,9 +210,13 @@ async def _drive_prefill(base_url: str, session_id: str) -> None:
 
             await _wait_until(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
-            assert body["agent_id"] == "ag_pinned_e2e", body
             assert body["host_id"] == _HOST_ID, body
-            assert body["workspace"] == _CONFIG_WORKSPACE, body
+            # The create names its project and OMITS the fields still holding
+            # their untouched config seed, so the server default-fills them
+            # from that same config (one source of truth instead of a copy).
+            assert body["project_id"] == _PROJECT_ID, body
+            assert "agent_id" not in body, body
+            assert "workspace" not in body, body
         finally:
             await browser.close()
 
@@ -333,8 +339,8 @@ async def _drive_sandbox_prefill(base_url: str, session_id: str) -> None:
 
             # The host chip shows the sandbox — proof the stored sandbox default
             # was honored rather than dropped for a connected host.
-            await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_contain_text(
-                "Sandbox", timeout=15_000
+            await expect(page.get_by_test_id("new-chat-landing-host-chip")).to_have_attribute(
+                "aria-label", re.compile(re.escape("Sandbox")), timeout=15_000
             )
 
             await page.get_by_test_id("new-chat-landing-input").fill("start here")
@@ -438,10 +444,11 @@ async def _drive_born_filed(base_url: str, session_id: str) -> None:
             await _wait_until(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
-            # Born filed: the create carries the legacy omni_project label so the
-            # sidebar files the new row under its project immediately, rather than
-            # flashing under "Sessions" until the follow-up project_id move lands.
-            labels = body.get("labels") or {}
-            assert labels.get("omni_project") == _PROJECT_NAME, body
+            # Born filed, first-class: the create names the project so the
+            # server files it at insert. No legacy omni_project label and no
+            # follow-up move — the row is a member from its first appearance,
+            # with no window where it exists unfiled.
+            assert body["project_id"] == _PROJECT_ID, body
+            assert (body.get("labels") or {}).get("omni_project") is None, body
         finally:
             await browser.close()

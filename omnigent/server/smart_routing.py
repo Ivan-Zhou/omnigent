@@ -12,13 +12,16 @@ swap in a different implementation via ``RuntimeCaps``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
-from omnigent.model_fallbacks import (
+from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.models.model_fallbacks import (
     SMART_ROUTING_CLAUDE_LADDER,
     SMART_ROUTING_CURRENT_GENERATION_GPT,
     SMART_ROUTING_FAMILY_FALLBACKS,
@@ -28,7 +31,7 @@ from omnigent.model_fallbacks import (
     SMART_ROUTING_TASK_V1_CLAUDE_ARMS,
     SMART_ROUTING_TASK_V1_CODEX_ARMS,
 )
-from omnigent.model_metadata import ModelCostTier, ModelIntent, ModelWireAPI
+from omnigent.models.model_metadata import ModelCostTier, ModelIntent, ModelWireAPI
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -36,7 +39,7 @@ if TYPE_CHECKING:
     import httpx  # used in type annotations only; runtime import is lazy in fetch_runner_models
     from databricks.sdk.config import Config
 
-    from omnigent.reasoning_effort import ModelEffortCaps
+    from omnigent.util.reasoning_effort import ModelEffortCaps
 
 _logger = logging.getLogger(__name__)
 
@@ -52,20 +55,25 @@ ROUTES_SELECT_PATH = "routes:select"
 #:
 #: Sized from the observed round trip: healthy ``routes:select`` answers land
 #: in ~1.4–3s, and the slowest sample on record (~6.7s) was a gateway 500, not
-#: a verdict. Five seconds therefore covers the healthy case with headroom
-#: while capping the hazard paths — a first-message hook and a subagent spawn
-#: gate — at a blink instead of the 30–45s a wedged server used to cost.
+#: a verdict. Nine seconds covers the healthy case with wide headroom while
+#: still capping the hazard paths — a first-message hook and a subagent spawn
+#: gate — well under the 30–45s a wedged server used to cost.
+#:
+#: This budget covers the CALL only. The hops above it must also absorb the
+#: candidate/catalog preparation that runs before it (~3s measured on a first
+#: message), which is why each of them sits several seconds higher rather than
+#: one second above this value.
 #:
 #: One attempt, no retry: on an interactive path a second try only doubles the
 #: stall, and falling open onto the harness's own model is the better answer.
-ROUTING_REQUEST_TIMEOUT_S = 5.0
+ROUTING_REQUEST_TIMEOUT_S = 9.0
 
 # ── Model lists per harness family ──────────────────────────────────────────
 #
 # Ordered cheapest → most powerful within each family. Live per-session catalogs
 # win wherever one is in reach (:func:`fetch_runner_models`); this table is the
 # fallback, so a stale entry pushes a router pick through the substitution path.
-# The ids themselves are owned records in :mod:`omnigent.model_fallbacks`.
+# The ids themselves are owned records in :mod:`omnigent.models.model_fallbacks`.
 
 MODEL_LISTS: dict[str, list[str]] = {
     "claude": list(SMART_ROUTING_CLAUDE_LADDER),
@@ -285,7 +293,93 @@ def _catalog_wire_apis(raw: object) -> frozenset[ModelWireAPI]:
     return frozenset(wire_apis)
 
 
+#: How long a fetched runner catalog stays servable without a re-fetch.
+#:
+#: The catalog is the installed CLI's model list: it changes on a relaunch or a
+#: provider-config edit, both of which invalidate this cache explicitly
+#: (:func:`invalidate_runner_catalog`). The TTL is only the backstop for a
+#: change nothing announced, so it is sized for "a long session should not go
+#: stale for hours", not for freshness per turn.
+RUNNER_CATALOG_TTL_S = 300.0
+
+#: session id → (monotonic deadline, catalog). Process-local, like every other
+#: runner-derived overlay cache on the server.
+_runner_catalog_cache: WorkspaceScopedCache[str, tuple[float, dict[str, list[_RunnerModel]]]] = (
+    WorkspaceScopedCache()
+)
+
+#: Single-flight per session, so a burst of turns costs one runner round trip.
+_runner_catalog_inflight: WorkspaceScopedCache[
+    str, asyncio.Task[dict[str, list[_RunnerModel]] | None]
+] = WorkspaceScopedCache()
+
+
+def invalidate_runner_catalog(session_id: str | None = None) -> None:
+    """Drop the cached runner catalog for *session_id* (or every session).
+
+    Called from the seam that already invalidates runner-derived snapshot
+    overlays, so a relaunched runner, a rebind, or a refreshed snapshot all
+    re-read the catalog instead of routing off the previous process's models.
+
+    :param session_id: Session/conversation identifier; ``None`` clears all.
+    """
+    if session_id is None:
+        _runner_catalog_cache.clear()
+        return
+    _runner_catalog_cache.pop(session_id, None)
+
+
+async def prefetch_runner_catalog(
+    session_id: str,
+    runner_client: httpx.AsyncClient,
+) -> None:
+    """Warm the catalog cache for *session_id* off the turn path.
+
+    Routing's candidate preparation is the runner round trip below, and paying
+    it while a user's prompt is held is what made the first message slow. A
+    launch-time call fills the cache so the first turn reads it instead.
+
+    :param session_id: Session/conversation identifier.
+    :param runner_client: Async HTTP client pointed at the runner.
+    """
+    await _fetch_runner_catalog(session_id, runner_client)
+
+
 async def _fetch_runner_catalog(
+    session_id: str,
+    runner_client: httpx.AsyncClient,
+) -> dict[str, list[_RunnerModel]] | None:
+    """Return this session's runner catalog, from cache when one is warm.
+
+    A miss runs :func:`_load_runner_catalog` under a per-session single flight,
+    so concurrent turns share one round trip. Only a parsed, non-empty catalog
+    is cached: an unreachable runner (a booting session) must stay re-fetchable
+    rather than pin "no catalog" for the whole TTL.
+
+    :param session_id: Session/conversation identifier.
+    :param runner_client: Async HTTP client pointed at the runner.
+    :returns: Worker names mapped to ordered model metadata, or ``None``.
+    """
+    cached = _runner_catalog_cache.get(session_id)
+    if cached is not None:
+        deadline, catalog = cached
+        if time.monotonic() < deadline:
+            return catalog
+        _runner_catalog_cache.pop(session_id, None)
+    inflight = _runner_catalog_inflight.get(session_id)
+    if inflight is None:
+        inflight = asyncio.ensure_future(_load_runner_catalog(session_id, runner_client))
+        _runner_catalog_inflight[session_id] = inflight
+        inflight.add_done_callback(
+            lambda _task, sid=session_id: _runner_catalog_inflight.pop(sid, None)
+        )
+    catalog = await asyncio.shield(inflight)
+    if catalog:
+        _runner_catalog_cache[session_id] = (time.monotonic() + RUNNER_CATALOG_TTL_S, catalog)
+    return catalog
+
+
+async def _load_runner_catalog(
     session_id: str,
     runner_client: httpx.AsyncClient,
 ) -> dict[str, list[_RunnerModel]] | None:
@@ -662,6 +756,24 @@ def _router_error_detail(body: str) -> str:
     return text[:300]
 
 
+def router_permanently_disabled(status_code: int, body: str) -> bool:
+    """Whether the router's answer reports a condition no retry can clear.
+
+    A workspace without the routing API answers ``routes:select`` with a 404
+    saying it is not enabled for the account. That is configuration, not an
+    outage: every later call would 404 identically, so the client latches it
+    and the deployment's other backend answers instead.
+
+    :param status_code: The response status.
+    :param body: The raw response text.
+    :returns: ``True`` when the service is disabled for this account.
+    """
+    if status_code != 404:
+        return False
+    text = (body or "").lower()
+    return "routes:select" in text and "not enabled" in text
+
+
 # ── Route-options seam ──────────────────────────────────────────────────────
 #
 # Every assumption about the router's wire contract lives here: the arms it
@@ -858,7 +970,7 @@ class RoutingSettings:
         endpoint. ``None`` uses :data:`_CURRENT_GENERATION_MODELS`.
     :param model_effort_caps: Per-model reasoning-effort ceilings this
         gateway imposes. ``None`` uses
-        :data:`~omnigent.reasoning_effort.DEFAULT_MODEL_EFFORT_CAPS`. The
+        :data:`~omnigent.util.reasoning_effort.DEFAULT_MODEL_EFFORT_CAPS`. The
         provider ladders themselves are not configurable — they are the wire
         APIs' own vocabularies, not a deployment fact.
     """
@@ -936,7 +1048,7 @@ def parse_routing_tables(
     :returns: Keyword arguments for :class:`RoutingSettings`; every value is
         ``None`` when the block names none of these keys.
     """
-    from omnigent.reasoning_effort import ModelEffortCaps
+    from omnigent.util.reasoning_effort import ModelEffortCaps
 
     cfg = routing_cfg if isinstance(routing_cfg, dict) else {}
     caps: ModelEffortCaps | None = None
@@ -1036,7 +1148,7 @@ def _model_family(model: str) -> str:
     subagent candidate filtering never disagree about a family; the
     ``"openai"`` token there is this file's ``"gpt"`` family.
     """
-    from omnigent.model_catalog import model_family_token
+    from omnigent.models.model_catalog import model_family_token
 
     bare = _bare_id(model).lower()
     token = model_family_token(bare)
@@ -1597,6 +1709,12 @@ class ExternalRoutingClient:
         # a 401 or the router's required-model-set error). Set on every failure
         # path, cleared on success.
         self.last_error: str | None = None
+        # Latched once the service reports a condition no retry can clear (the
+        # routing API is not enabled for this account). Every later call short-
+        # circuits to the stored reason, so a deployment whose workspace has no
+        # routing API pays one request, not one per turn.
+        self.permanently_unavailable = False
+        self._permanent_error: str | None = None
 
     def _resolve_credentials(self) -> tuple[Any, Mapping[str, str]]:  # type: ignore[explicit-any]
         """Resolve one request's credentials as ``(httpx auth, extra headers)``.
@@ -1695,6 +1813,11 @@ class ExternalRoutingClient:
 
         from omnigent.api.routing.v1 import routing_pb2 as pb
 
+        if self.permanently_unavailable:
+            # The account has no routing API; skip the call rather than spend a
+            # round trip per turn to be told so again.
+            self.last_error = self._permanent_error
+            return None
         # The seam turns the catalog into router vocabulary and injects
         # whatever arms the router's scenario menu demands.
         harnesses = list(available_models)
@@ -1763,6 +1886,14 @@ class ExternalRoutingClient:
             self.last_error = (
                 f"router returned HTTP {resp.status_code}: {_router_error_detail(resp.text)}"
             )
+            if router_permanently_disabled(resp.status_code, resp.text):
+                _logger.warning(
+                    "ExternalRoutingClient: %s is not enabled for this account; "
+                    "no further routes:select calls will be made in this process",
+                    self._url,
+                )
+                self.permanently_unavailable = True
+                self._permanent_error = self.last_error
             return None
         try:
             out = json_format.ParseDict(resp.json(), pb.SelectRouteResponse())
@@ -1933,10 +2064,14 @@ async def route_session_harness(
     except ImportError:
         return None, None, None, "Smart routing is not available."
 
-    from omnigent.server.routing_backend import backends_from_caps, select_router
+    from omnigent.server.routing_backend import (
+        backends_from_caps,
+        route_with_fallback,
+        select_router,
+    )
 
-    router = select_router(backends_from_caps(_caps), gateway_backed=gateway_backed)
-    if router is None:
+    backends = backends_from_caps(_caps)
+    if select_router(backends, gateway_backed=gateway_backed) is None:
         return None, None, None, "Smart routing is not configured on this server."
 
     # Fetch the live catalog. Its rows are keyed by worker name (sub-agent
@@ -2004,15 +2139,20 @@ async def route_session_harness(
         return None, None, None, "No routable harnesses are available on this runner."
 
     try:
-        result = await router.client.route(user_message, harness_models)
+        call = await route_with_fallback(
+            backends, user_message, harness_models, gateway_backed=gateway_backed
+        )
     except Exception as exc:  # routing failures must not block session creation
         _logger.exception("smart_routing: route_session_harness failed")
         return None, None, None, f"Routing call failed: {failure_detail(exc)}"
+    if call is None:
+        return None, None, None, "Smart routing is not configured on this server."
+    result = call.result
 
     if result is None:
         # Surface the client's specific failure reason (e.g. HTTP 401 with the
         # gateway's message) when it exposes one; otherwise a generic note.
-        detail = routing_last_error(router.client)
+        detail = routing_last_error(call.client)
         reason = (
             f"Routing unavailable: {detail}"
             if detail
@@ -2035,6 +2175,27 @@ async def route_session_harness(
         if result.harness
         else harness_for_model(chosen_model, harness_models, prefixes=prefixes)
     )
+    if chosen_harness is not None and chosen_harness not in harness_models:
+        # A harness this call never offered is not a verdict — it is a pick the
+        # caller cannot honor. A child confined to one harness would otherwise
+        # have another family's harness written to its row and stamped
+        # "applied" while its pane keeps running the harness it booted on.
+        # A verdict may still spell an offered harness as its WORKER name
+        # (``claude_code``), which is the same harness, not an escape.
+        from omnigent.harness_aliases import canonicalize_harness
+
+        _spelled = _WORKER_NAME_TO_HARNESS.get(chosen_harness) or canonicalize_harness(
+            chosen_harness
+        )
+        if _spelled in harness_models:
+            chosen_harness = _spelled
+        else:
+            _logger.info(
+                "smart_routing: dropping verdict harness=%s; offered=%s",
+                chosen_harness,
+                offered,
+            )
+            chosen_harness = None
     if chosen_harness is None and result.harness in harness_models:
         # Every offered harness bars the pick, and the family the caller allowed
         # is not negotiable — swap the model instead of the harness.
@@ -2070,7 +2231,7 @@ async def route_session_harness(
     verdict: dict[str, Any] = {
         "model": chosen_model,
         "rationale": result.rationale,
-        "router_source": router.source,
+        "router_source": call.source,
     }
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(chosen_model, prefixes):
         verdict["raw_model"] = raw_model
@@ -2120,10 +2281,14 @@ async def route_turn(
     except ImportError:
         return None, None
 
-    from omnigent.server.routing_backend import backends_from_caps, select_router
+    from omnigent.server.routing_backend import (
+        backends_from_caps,
+        route_with_fallback,
+        select_router,
+    )
 
-    router = select_router(backends_from_caps(_caps), gateway_backed=gateway_backed)
-    if router is None:
+    backends = backends_from_caps(_caps)
+    if select_router(backends, gateway_backed=gateway_backed) is None:
         _logger.info(
             "smart_routing: route_turn skipped for session=%s: no routing client configured",
             session_id,
@@ -2131,6 +2296,11 @@ async def route_turn(
         return None, None
 
     _logger.info("smart_routing: routing turn session=%s harness=%s", session_id, harness)
+    # Candidate preparation used to be invisible in the logs, so a slow first
+    # message read as a slow router. Time the two phases separately: this is
+    # the number the timeout ladder above the hook has to cover.
+    _prep_started = time.monotonic()
+    _catalog_fetched = False
     # Prefer the live runner catalog, but only its "self" row — the sub-agent
     # workers' models are not this session's. Key the map by harness id, not the
     # "self" label, so the seam infers the right single-harness scenario.
@@ -2140,6 +2310,7 @@ async def route_turn(
         if in_vocabulary:
             available = {harness or "self": in_vocabulary}
     if available is None and session_id and runner_client is not None:
+        _catalog_fetched = True
         runner_catalog = await fetch_runner_models(session_id, runner_client)
         if runner_catalog and "self" in runner_catalog:
             # A native terminal's own catalog can list models from other
@@ -2186,9 +2357,22 @@ async def route_turn(
             )
             return None, None
 
-    result = await router.client.route(user_message, available)
-    if result is None:
+    _prep_s = time.monotonic() - _prep_started
+    _route_started = time.monotonic()
+    call = await route_with_fallback(
+        backends, user_message, available, gateway_backed=gateway_backed
+    )
+    _logger.info(
+        "smart_routing: session=%s prep=%.3fs router=%.3fs catalog_fetch=%s candidates=%d",
+        session_id,
+        _prep_s,
+        time.monotonic() - _route_started,
+        _catalog_fetched,
+        sum(len(models) for models in available.values()),
+    )
+    if call is None or call.result is None:
         return None, None
+    result = call.result
 
     # An injected arm can still come back barred (the menu is offered whole), and
     # a turn cannot change harness — so swap the model for one this gateway
@@ -2220,7 +2404,7 @@ async def route_turn(
     verdict: dict[str, Any] = {
         "model": model,
         "rationale": result.rationale,
-        "router_source": router.source,
+        "router_source": call.source,
     }
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(model, prefixes):
         verdict["raw_model"] = raw_model
