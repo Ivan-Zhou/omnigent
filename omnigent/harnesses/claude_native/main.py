@@ -3307,6 +3307,15 @@ def resolve_native_claude_config(
         entry = _resolve_provider_for_build(spec, harness_type="claude-sdk")
         if entry is not None:
             return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
+        global_auth = _load_global_auth()
+        if getattr(spec.executor, "auth", None) is None and isinstance(
+            global_auth, DatabricksAuth
+        ):
+            global_ucode_config = _ucode_config_for_profile(
+                global_auth.profile, refresh_models=refresh_models
+            )
+            if global_ucode_config is not None:
+                return global_ucode_config
         ucode_config = _ucode_config_for_profile(
             spec.executor.profile, refresh_models=refresh_models
         )
