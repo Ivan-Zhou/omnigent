@@ -1959,6 +1959,10 @@ async def _maybe_rotate_session_on_thread_started(
     # its own Omnigent child session by ``_handle_event``.
     if _thread_started_is_subagent(event):
         return False
+    # Codex emits internal housekeeping threads that cannot persist history or
+    # host goals. Rotating onto one strands the real turn's output as stale.
+    if _thread_started_is_ephemeral(event):
+        return False
     old_delta_coalescer = target.delta_coalescer
     await old_delta_coalescer.flush()
     old_usage_coalescer = target.usage_coalescer
@@ -6830,6 +6834,19 @@ def _thread_started_is_subagent(event: CodexMessage) -> bool:
     if not isinstance(thread, dict):
         return False
     return _thread_spawn_source(thread) is not None
+
+
+def _thread_started_is_ephemeral(event: CodexMessage) -> bool:
+    """Return whether a ``thread/started`` event announces an ephemeral thread."""
+    if event.get("method") != "thread/started":
+        return False
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return False
+    thread = params.get("thread")
+    if not isinstance(thread, dict):
+        return False
+    return thread.get("ephemeral") is True
 
 
 async def wait_for_thread_started(

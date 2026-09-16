@@ -2673,3 +2673,65 @@ async def test_delta_coalescer_survives_a_cancelled_flush_caller() -> None:
     )
     await asyncio.wait_for(coalescer.flush(), timeout=5.0)
     assert len(client.posts) > posts_before
+
+
+def test_thread_started_is_ephemeral_true_for_ephemeral_system_thread() -> None:
+    event: dict[str, object] = {
+        "method": "thread/started",
+        "params": {
+            "thread": {
+                "id": "0195aaaa-system",
+                "ephemeral": True,
+                "path": None,
+                "threadSource": "system",
+            }
+        },
+    }
+
+    assert fwd._thread_started_is_ephemeral(event) is True
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"method": "thread/started", "params": {"thread": {"ephemeral": False}}},
+        {"method": "thread/started", "params": {"thread": {}}},
+        {"method": "thread/updated", "params": {"thread": {"ephemeral": True}}},
+        {"method": "thread/started"},
+    ],
+)
+def test_thread_started_is_ephemeral_false_for_other_events(event: dict) -> None:
+    assert fwd._thread_started_is_ephemeral(event) is False
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_thread_started_does_not_rotate_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    create_replacement = AsyncMock(side_effect=AssertionError("session rotated"))
+    monkeypatch.setattr(fwd, "_create_thread_replacement_session", create_replacement)
+    target = fwd._ForwarderTarget(
+        session_id="conv_parent",
+        thread_id="thread_parent",
+        delta_coalescer=MagicMock(),
+        usage_coalescer=MagicMock(),
+        elicitation_tracker=MagicMock(),
+    )
+    event: dict[str, object] = {
+        "method": "thread/started",
+        "params": {"thread": {"id": "thread_system", "ephemeral": True}},
+    }
+
+    rotated = await fwd._maybe_rotate_session_on_thread_started(
+        ap_client=MagicMock(),
+        target=target,
+        bridge_dir=tmp_path,
+        app_server_url="ws://127.0.0.1:9876",
+        event=event,
+    )
+
+    assert rotated is False
+    create_replacement.assert_not_awaited()
+    assert target.session_id == "conv_parent"
+    assert target.thread_id == "thread_parent"
