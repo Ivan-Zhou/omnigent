@@ -13,6 +13,7 @@ from pathlib import Path
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
+    EFFORT_DIALOG_HINT,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudePromptTimeout,
@@ -40,6 +41,7 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.native_attachments import attachment_reference_line
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
+from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 _logger = logging.getLogger(__name__)
 
@@ -79,6 +81,8 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` when the model actually changes. Seeded lazily from the
         # spawn ``launch_model`` on the first turn (``None`` = not yet known).
         self._applied_model: str | None = None
+        # Avoid reissuing the cache-invalidating effort command every turn.
+        self._applied_effort: str | None = None
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` because output is emitted by the transcript forwarder."""
@@ -141,11 +145,10 @@ class ClaudeNativeExecutor(Executor):
             ``omnigent.runner.native.orchestration`` and
             ``omnigent.harnesses.claude_native.main``) — not per-turn through this
             parameter.
-        :param config: Per-turn executor config. Only ``config.model``
-            is used: when intelligent routing picks a model for this turn,
-            it arrives here (adapter maps ``request.model_override`` →
-            ``config.model``) and the switch is applied inline, before the
-            message — see the ``/model`` handling below.
+        :param config: Per-turn executor config. A routed model arrives in
+            ``config.model`` and the session effort in
+            ``config.extra["reasoning_effort"]``. Both are applied inline,
+            before the message.
         :yields: :class:`TurnComplete` after the input was injected,
             or :class:`ExecutorError` on bridge failure.
         """
@@ -197,6 +200,10 @@ class ClaudeNativeExecutor(Executor):
         # box and verifies its submit) delivers the message — in order,
         # once.
         wanted_model = config.model if config is not None else None
+        raw_effort = config.extra.get("reasoning_effort") if config is not None else None
+        wanted_effort = (
+            raw_effort if isinstance(raw_effort, str) and raw_effort in CLAUDE_EFFORTS else None
+        )
         # ``/model`` only accepts this session's aliases / custom slot; a
         # bare catalog id is ignored and the pane keeps its old model.
         wanted_model_arg = self._model_command_arg(wanted_model)
@@ -221,6 +228,17 @@ class ClaudeNativeExecutor(Executor):
                         # Track the routed id, not the alias: the next turn's
                         # comparison is against what routing asked for.
                         self._applied_model = wanted_model
+                    if wanted_effort is not None and wanted_effort != self._applied_effort:
+                        await self._inject(
+                            partial(
+                                inject_slash_command,
+                                self._bridge_dir,
+                                command=f"/effort {wanted_effort}",
+                                auto_confirm=True,
+                                confirm_hint=EFFORT_DIALOG_HINT,
+                            )
+                        )
+                        self._applied_effort = wanted_effort
                     await self._inject(
                         partial(inject_user_message, self._bridge_dir, content=text)
                     )
