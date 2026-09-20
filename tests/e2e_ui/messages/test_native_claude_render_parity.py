@@ -37,6 +37,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.chat.test_always_steer import _open_general_settings
 from tests.e2e_ui.conftest import reset_mock_llm, set_fallback_mock_llm
 
 # Reuse the custom-agent suite's helpers — both surfaces render from the same
@@ -472,6 +473,15 @@ def test_native_claude_composer_delivers_into_an_occupied_tui(
     _open_terminal_view(page)
     _wait_terminal_connected(page)
     _ensure_chat_view(page)
+    # Reclaiming an occupied TUI is the behavior under test. Always steer keeps
+    # the web-composer send on the immediate-delivery path while the TUI surface
+    # is open, including Claude's waiting/rewind state.
+    toggle = _open_general_settings(page, base_url, from_chat=True)
+    expect(toggle).to_have_attribute("aria-checked", "false")
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-checked", "true")
+    page.get_by_role("link", name="Back", exact=True).click()
+    expect(page).to_have_url(re.compile(rf"/c/{re.escape(session_id)}(?:\?.*)?$"))
     reset_mock_llm(mock_llm_server_url)
 
     nonces = [uuid.uuid4().hex[:8] for _ in range(len(_OCCUPYING_SURFACES) + 1)]
