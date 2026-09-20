@@ -13,14 +13,13 @@ real LLM → nightly + generous timeout.
 
 The second test
 (:func:`test_reparked_elicitation_reliably_resurfaces_in_inbox`) covers
-omnigent#927: when a hook retry re-parks the *same* elicitation id after the
-user already approved it, the inbox card must drop its stale optimistic
-verdict and resurface as an actionable pending card — not stay frozen on
-"Approved" with no buttons. It drives the real claude-native permission hook
-(``POST /v1/sessions/{id}/hooks/permission-request``) so the re-park is a
-genuine server round-trip, and repeats the approve→re-park cycle with
-randomized timing to walk the 4s websocket rescan window the bug raced
-against.
+the current stable-id contract. A hook retry with the same request params
+consumes the matching server-side verdict tombstone and returns the approved
+decision immediately, without re-publishing an inbox card. Once that
+tombstone is consumed, the same id can be parked again as a genuinely new
+pending request; the inbox must clear its stale optimistic verdict and make
+that card actionable. It drives the real claude-native permission hook
+(``POST /v1/sessions/{id}/hooks/permission-request``) through both paths.
 """
 
 from __future__ import annotations
@@ -42,8 +41,8 @@ _INBOX_ITEM = '[data-testid="inbox-item"]'
 _AGENT_TURN_TIMEOUT_MS = 120_000
 
 # Re-park stress knobs (test_reparked_elicitation_reliably_resurfaces_in_inbox).
-# Several cycles, each with a randomized re-park delay, so the regression is
-# exercised across the rescan window rather than at one lucky interleaving.
+# Several cycles exercise both the matching-tombstone fast path and the
+# subsequent genuine re-park across the rescan window.
 _REPARK_CYCLES = 3
 # The session-list WS (``/v1/sessions/updates``) re-reads + diffs each watched
 # session every 4s (``_SESSION_UPDATES_RESCAN_INTERVAL_S``). The re-park must
@@ -185,6 +184,22 @@ def _park_in_thread(
     :returns: The sink dict the worker writes its verdict/error into; it also
         carries the worker thread under ``"thread"`` for the later join.
     """
+    sink = _start_permission_hook(base_url, session_id, elicitation_id, workers)
+    _wait_for(partial(_is_parked, base_url, session_id, elicitation_id), timeout_s=30.0)
+    return sink
+
+
+def _start_permission_hook(
+    base_url: str,
+    session_id: str,
+    elicitation_id: str,
+    workers: list[threading.Thread],
+) -> dict:
+    """Start a hook request without assuming it will park.
+
+    A matching verdict tombstone is consumed at registration time, so that
+    request returns immediately instead of appearing in the pending index.
+    """
     sink: dict = {}
     worker = threading.Thread(
         target=_park_permission_hook,
@@ -194,7 +209,6 @@ def _park_in_thread(
     sink["thread"] = worker
     workers.append(worker)
     worker.start()
-    _wait_for(partial(_is_parked, base_url, session_id, elicitation_id), timeout_s=30.0)
     return sink
 
 
@@ -255,34 +269,21 @@ def test_reparked_elicitation_reliably_resurfaces_in_inbox(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A re-parked, already-approved elicitation resurfaces as an actionable card.
+    """Matching verdict tombstones replay, while later re-parks stay actionable.
 
-    Regression for omnigent#927. When the user approves an inbox approval, the
-    page flips it to "Approved" optimistically (``responded`` keyed by
-    elicitation id). When a hook retry later re-parks the SAME id (the server
-    re-parks after its disconnect/grace window), the session snapshot lists it
-    as pending again — but the stale ``responded`` entry pinned the card to
-    "Approved" with no buttons, leaving a headless sub-agent invisibly blocked.
-    The fix sweeps verdicts whose id is pending again whenever a snapshot
-    refresh lands (``dataUpdatedAt`` advances).
+    After the initial approval, the first retry uses the same request params,
+    so the server consumes the matching verdict tombstone and immediately
+    returns ``200 allow`` without publishing a pending card. The next retry
+    has no tombstone left and genuinely re-parks the same id; the inbox must
+    sweep its stale optimistic verdict and make that card actionable.
 
-    Recreated end to end against the live server: one elicitation id is parked,
-    approved in a real browser, then re-parked again and again through the real
-    claude-native permission hook (``POST .../hooks/permission-request``) — the
-    omnigent#927 shape of a single prompt whose hook keeps re-parking the same
-    id. Each retry must bring the card back as a *pending* card
-    (``data-state="pending"`` with an Approve button), never a frozen
-    "Approved" one. Several retries with randomized delays prove the resurface
-    is robust, not a one-off interleaving.
+    The full cycle runs repeatedly through the real claude-native permission
+    hook (``POST .../hooks/permission-request``), proving both the idempotent
+    approval replay and the stale-verdict recovery path.
 
-    Timing note: each retry is issued only after the inbox has observed the
-    approval drain the count to zero (card gone) plus one ``_WS_RESCAN_S``
-    window, so the session-list socket registers the drop before the bump —
-    exactly the real flow where the retry arrives seconds later. Issuing it
-    inside a single rescan tick is a *separate* coalescing gap (the socket
-    never reports the bounce, and the row's ``updated_at`` does not move on a
-    re-park) that this fix does not address; this test stays on the path the
-    fix governs.
+    Each genuine re-park is issued only after the inbox has observed the
+    approval drain plus one ``_WS_RESCAN_S`` window, so the session-list socket
+    registers the drop before the bump.
 
     No real LLM: the hook endpoint parks elicitations directly, which is also
     the only way to deterministically re-park the *same* id (a model-driven
@@ -304,7 +305,7 @@ def test_reparked_elicitation_reliably_resurfaces_in_inbox(
     workers: list[threading.Thread] = []
     try:
         # Initial park + approve: surfaces the card and sets the optimistic
-        # "Approved" verdict the later retries must not get stuck behind.
+        # "Approved" verdict used by the replay and genuine re-park checks.
         sink = _park_in_thread(base_url, session_id, eid, workers)
         first = page.locator(f'{_APPROVAL_CARD}[data-state="pending"]')
         expect(first).to_be_visible(timeout=_REPARK_TIMEOUT_MS)
@@ -313,15 +314,18 @@ def test_reparked_elicitation_reliably_resurfaces_in_inbox(
         _settle_after_drain(page, base_url, session_id, rng)
 
         for cycle in range(_REPARK_CYCLES):
-            # A hook retry re-parks the SAME id.
+            # The matching tombstone is consumed immediately: this retry is
+            # an idempotent allow, not a new inbox card.
+            replay = _start_permission_hook(base_url, session_id, eid, workers)
+            _assert_allow(replay, f"tombstone replay {cycle}")
+            _wait_for(lambda: not _pending_elicitations(base_url, session_id))
+            expect(page.locator(_APPROVAL_CARD)).to_have_count(0, timeout=_REPARK_TIMEOUT_MS)
+
+            # With the tombstone consumed, the next retry genuinely parks the
+            # SAME id. This is the stale-optimistic-verdict regression path.
             sink = _park_in_thread(base_url, session_id, eid, workers)
 
-            # ── REGRESSION: the re-parked prompt must be actionable again. ──
-            # The card returns either way; the bug is its STATE. Pre-fix the
-            # stale verdict freezes it at data-state="responded" with no
-            # buttons (the data-state assertion below times out); post-fix the
-            # snapshot refresh sweeps the verdict and it reverts to pending with
-            # Approve restored.
+            # ── REGRESSION: the genuine re-park must be actionable again. ──
             resurfaced = page.locator(_APPROVAL_CARD)
             expect(resurfaced).to_have_count(1, timeout=_REPARK_TIMEOUT_MS)
             expect(resurfaced).to_have_attribute(
@@ -329,8 +333,8 @@ def test_reparked_elicitation_reliably_resurfaces_in_inbox(
             )
             expect(resurfaced.get_by_role("button", name="Approve", exact=True)).to_be_visible()
 
-            # Approve again (re-arming the stale verdict), then settle so the
-            # next retry is a clean 0→1 diff the socket won't coalesce.
+            # Approve again, then settle so the next retry is a clean 0→1 diff
+            # the socket won't coalesce.
             resurfaced.get_by_role("button", name="Approve", exact=True).click()
             _assert_allow(sink, f"re-park {cycle}")
             _settle_after_drain(page, base_url, session_id, rng)
