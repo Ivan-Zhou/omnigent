@@ -36,6 +36,9 @@ concurrency:
 jobs:
   approve:
     name: Maintainer Approval
+    # The upstream maintainer list governs PRs into upstream. Fork PRs targeting
+    # upstream still run in the upstream repository context.
+    if: ${{ github.repository == 'omnigent-ai/omnigent' }}
     permissions:
       contents: read
       pull-requests: read
