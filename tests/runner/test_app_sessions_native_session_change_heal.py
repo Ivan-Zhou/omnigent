@@ -174,12 +174,14 @@ async def test_session_change_heals_dead_registered_missing_tmux_socket(
     event: dict[str, Any],
     expected_command: str,
 ) -> None:
-    """Dead registry + missing sock must heal, then inject, not 503.
+    """Model changes heal a dead pane; effort changes defer to the next turn.
 
-    ``inject_slash_command`` is the real function while the pane is still
-    stale: that is the gap (tmux cannot connect to the advertised socket).
-    After ``_ensure_native_terminal_for_turn`` recreates the pane, the
-    inject is recorded so the handler can finish without a live Claude TUI.
+    For model changes, ``inject_slash_command`` is the real function while
+    the pane is still stale: that is the gap (tmux cannot connect to the
+    advertised socket). After ``_ensure_native_terminal_for_turn`` recreates
+    the pane, the inject is recorded so the handler can finish without a live
+    Claude TUI. Effort changes intentionally do neither because the executor
+    applies the remembered effort with the next message.
     """
     conv_id = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
     if event["type"] == "effort_change":
@@ -226,11 +228,13 @@ async def test_session_change_heals_dead_registered_missing_tmux_socket(
     assert resp.status_code == 204, (
         f"dead-but-registered pane must heal before inject; got {resp.status_code}: {resp.text}"
     )
-    assert auto_create_calls == [conv_id], (
+    expected_auto_create_calls = [] if event["type"] == "effort_change" else [conv_id]
+    expected_captured = [] if event["type"] == "effort_change" else [expected_command]
+    assert auto_create_calls == expected_auto_create_calls, (
         f"_ensure_native_terminal_for_turn must recreate the pane; "
         f"got auto_create_calls={auto_create_calls!r}"
     )
-    assert captured == [expected_command], (
+    assert captured == expected_captured, (
         f"healed pane must receive {expected_command!r}; got {captured!r}"
     )
 
@@ -387,14 +391,14 @@ async def test_session_change_live_pane_does_not_recreate(
     async with _runner_client(app) as client:
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
-            json={"type": "effort_change", "effort": "high"},
+            json={"type": "model_change", "model": "sonnet"},
         )
 
     assert resp.status_code == 204, resp.text
     assert auto_create_calls == [], (
         f"live pane must not recreate; got auto_create_calls={auto_create_calls!r}"
     )
-    assert captured == ["/effort high"]
+    assert captured == ["/model sonnet"]
     # A live pane is never readiness-polled: only a recreate reboots the TUI.
     # See ``test_live_pane_with_occupied_composer_does_not_stall`` for why
     # polling a live pane would be actively harmful.
@@ -476,12 +480,12 @@ async def test_live_pane_with_occupied_composer_does_not_stall(
     async with _runner_client(app) as client:
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
-            json={"type": "effort_change", "effort": "high"},
+            json={"type": "model_change", "model": "sonnet"},
         )
     elapsed = time.monotonic() - started
 
     assert resp.status_code == 204, resp.text
-    assert captured == ["/effort high"]
+    assert captured == ["/model sonnet"]
     assert auto_create_calls == [], "a live pane must not be recreated"
     assert pane_ready_calls == [], (
         f"live pane must not be readiness-probed; got {pane_ready_calls!r}"
@@ -615,12 +619,12 @@ async def test_recreated_pane_is_waited_for_before_injection(
     async with _runner_client(app) as client:
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
-            json={"type": "effort_change", "effort": "high"},
+            json={"type": "model_change", "model": "sonnet"},
         )
 
     assert resp.status_code == 204, resp.text
     assert auto_create_calls == [conv_id], "dead pane must be recreated"
-    assert captured == ["/effort high"]
+    assert captured == ["/model sonnet"]
     assert next(readiness, "exhausted") == "exhausted", (
         "the poll must keep probing until the booting pane reports ready"
     )
@@ -667,13 +671,13 @@ async def test_failed_recreate_does_not_wait(
     async with _runner_client(app) as client:
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
-            json={"type": "effort_change", "effort": "high"},
+            json={"type": "model_change", "model": "sonnet"},
         )
     elapsed = time.monotonic() - started
 
     assert resp.status_code == 204, resp.text
     assert auto_create_calls == [conv_id], "the heal must still be attempted"
-    assert captured == ["/effort high"]
+    assert captured == ["/model sonnet"]
     assert pane_ready_calls == [], (
         f"a recreate that made no pane must not be polled; got {pane_ready_calls!r}"
     )

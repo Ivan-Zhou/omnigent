@@ -1942,10 +1942,11 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
     inject_attr: str,
 ) -> None:
     """
-    Native effort / model dispatch must call
+    Native model dispatch must call
     ``_claude_native_bridge_id_for_session`` to resolve the
     bridge_id, not pass conv_id straight to
-    ``bridge_dir_for_conversation_id``.
+    ``bridge_dir_for_conversation_id``. Effort dispatch is deliberately
+    excluded from the lookup because it defers /effort to the next turn.
 
     Regression test for the bug that forced a revert. The
     handlers used ``bridge_dir_for_conversation_id(conv_id)``
@@ -2017,12 +2018,18 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
             json=event_payload,
         )
 
-    # The dispatch ran the native handler (inject was called via the
-    # fake, which doesn't raise) and returned 204.
+    # Both native handlers return 204. The effort handler intentionally does
+    # not resolve a bridge or inject anything because it defers to the turn.
     assert resp.status_code == 204, (
         f"Native dispatch for {event_payload['type']!r} must return "
         f"204; got {resp.status_code}: {resp.text}"
     )
+    if event_payload["type"] == "effort_change":
+        assert captured_bridge_dir == [], (
+            "effort_change must defer /effort to the executor turn without "
+            f"resolving a bridge; got {captured_bridge_dir!r}"
+        )
+        return
     # Exactly one inject call, with the bridge_dir derived from the
     # sentinel bridge_id — NOT from the conv_id.
     assert len(captured_bridge_dir) == 1, (
