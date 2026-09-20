@@ -26,6 +26,9 @@ permissions:
 jobs:
   monitor:
     name: monitor nightly result
+    # Only upstream owns the issue tracker and maintainer rotation monitored by
+    # this workflow.
+    if: ${{ github.repository == 'omnigent-ai/omnigent' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
