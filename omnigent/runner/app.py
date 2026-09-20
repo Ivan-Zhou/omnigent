@@ -5927,44 +5927,13 @@ def create_runner_app(
         conv_id: str,
         effort: str | None,
     ) -> Response:
-        from omnigent.harnesses.claude_native.bridge import (
-            EFFORT_DIALOG_HINT,
-            bridge_dir_for_bridge_id,
-            inject_slash_command,
-        )
         from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
+        del conv_id
         if effort is None or effort not in CLAUDE_EFFORTS:
             return Response(status_code=204)
-        bridge_id = await _claude_native_bridge_id_for_session(
-            server_client=server_client,
-            session_id=conv_id,
-        )
-        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
-        command = f"/effort {effort}"
-        try:
-            # An effort switch invalidates the prompt cache on a session with
-            # history, so Claude Code asks to confirm; the chat UI cannot render
-            # that TUI dialog, so answer it by its own title.
-            await asyncio.to_thread(
-                inject_slash_command,
-                bridge_dir,
-                command=command,
-                timeout_s=1.0,
-                auto_confirm=True,
-                confirm_hint=EFFORT_DIALOG_HINT,
-            )
-        except (RuntimeError, ValueError) as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "claude_native_effort_failed",
-                    "detail": _client_safe_error_detail(
-                        exc, context="claude-native effort change"
-                    ),
-                },
-            )
+        # This process cannot share the harness executor's injection lock. The
+        # remembered effort rides on the next turn and is applied there safely.
         return Response(status_code=204)
 
     async def _watch_late_model_dialog(

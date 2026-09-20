@@ -137,18 +137,14 @@ async def test_events_effort_change_on_native_session_skips_inject_for_unsupport
 
 
 @pytest.mark.asyncio
-async def test_events_effort_change_on_native_session_returns_503_when_bridge_not_ready(
+async def test_events_effort_change_on_native_session_does_not_require_ready_bridge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Bridge-not-ready RuntimeError surfaces as 503 from /events.
+    Effort persistence succeeds even when the Claude pane is not ready.
 
-    Sister to the happy-path test. Pins that the failure mode of the
-    native effort dispatch (tmux pane gone / bridge dir not yet
-    advertised) returns 503 with the same error code shape the
-    legacy route returns. Omnigent server's PATCH swallows this 503 and
-    still returns 200 with the persisted value — the next spawn
-    will apply the new effort via ``--effort``.
+    The executor applies the remembered effort with the next message, so the
+    control event must not touch tmux or fail while a new terminal is booting.
     """
     from omnigent.spec.types import ExecutorSpec
 
@@ -160,9 +156,9 @@ async def test_events_effort_change_on_native_session_returns_503_when_bridge_no
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
     ) -> None:
-        """Simulate the bridge-not-ready path."""
-        del bridge_dir, command, timeout_s
-        raise RuntimeError("tmux target is not advertised")
+        """Fail if the control event tries to reach the booting pane."""
+        del bridge_dir, command, timeout_s, auto_confirm, confirm_hint
+        raise AssertionError("effort_change must not inject before the next turn")
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
@@ -199,15 +195,9 @@ async def test_events_effort_change_on_native_session_returns_503_when_bridge_no
             json={"type": "effort_change", "effort": "high"},
         )
 
-    assert resp.status_code == 503, (
-        f"Native effort_change with inject failure must return 503; "
+    assert resp.status_code == 204, (
+        f"Native effort_change must not depend on pane readiness; "
         f"got {resp.status_code}: {resp.text}"
-    )
-    body = resp.json()
-    # ``claude_native_effort_failed`` is the same error code the
-    # legacy route uses — keeps the failure shape stable for callers.
-    assert body.get("error") == "claude_native_effort_failed", (
-        f"503 body must carry the bridge-failure error code; got {body!r}"
     )
 
 
@@ -1952,10 +1942,11 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
     inject_attr: str,
 ) -> None:
     """
-    Native effort / model dispatch must call
+    Native model dispatch must call
     ``_claude_native_bridge_id_for_session`` to resolve the
     bridge_id, not pass conv_id straight to
-    ``bridge_dir_for_conversation_id``.
+    ``bridge_dir_for_conversation_id``. Effort dispatch is deliberately
+    excluded from the lookup because it defers /effort to the next turn.
 
     Regression test for the bug that forced a revert. The
     handlers used ``bridge_dir_for_conversation_id(conv_id)``
@@ -2027,12 +2018,18 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
             json=event_payload,
         )
 
-    # The dispatch ran the native handler (inject was called via the
-    # fake, which doesn't raise) and returned 204.
+    # Both native handlers return 204. The effort handler intentionally does
+    # not resolve a bridge or inject anything because it defers to the turn.
     assert resp.status_code == 204, (
         f"Native dispatch for {event_payload['type']!r} must return "
         f"204; got {resp.status_code}: {resp.text}"
     )
+    if event_payload["type"] == "effort_change":
+        assert captured_bridge_dir == [], (
+            "effort_change must defer /effort to the executor turn without "
+            f"resolving a bridge; got {captured_bridge_dir!r}"
+        )
+        return
     # Exactly one inject call, with the bridge_dir derived from the
     # sentinel bridge_id — NOT from the conv_id.
     assert len(captured_bridge_dir) == 1, (

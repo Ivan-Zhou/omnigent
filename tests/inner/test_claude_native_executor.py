@@ -1003,6 +1003,137 @@ async def test_run_turn_applies_routed_model_before_message_under_one_lock(
 
 
 @pytest.mark.asyncio
+async def test_run_turn_applies_effort_before_message_under_one_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A requested effort is applied before the message in one injection sequence."""
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    calls: list[tuple[str, str, bool, str | None]] = []
+
+    def fake_inject_slash_command(
+        bridge_dir_arg: Path,
+        *,
+        command: str,
+        timeout_s: float = 30.0,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        calls.append(("slash", command, auto_confirm, confirm_hint))
+
+    def fake_inject_user_message(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+    ) -> None:
+        del bridge_dir_arg, timeout_s
+        calls.append(("message", content, False, None))
+
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(extra={"reasoning_effort": "xhigh"}),
+        )
+    ]
+
+    assert calls == [
+        (
+            "slash",
+            "/effort xhigh",
+            True,
+            claude_bridge.EFFORT_DIALOG_HINT,
+        ),
+        ("message", "hello", False, None),
+    ]
+    assert events == [TurnComplete(response=None)]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_does_not_reapply_unchanged_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The same session effort is applied only once across consecutive turns."""
+    calls: list[str] = []
+
+    def fake_inject_slash_command(
+        bridge_dir_arg: Path,
+        *,
+        command: str,
+        timeout_s: float = 30.0,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
+        calls.append(command)
+
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor, "inject_user_message", lambda *args, **kwargs: None
+    )
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    for message in ("first", "second"):
+        events = [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": message}],
+                tools=[],
+                system_prompt="",
+                config=ExecutorConfig(extra={"reasoning_effort": "high"}),
+            )
+        ]
+        assert events == [TurnComplete(response=None)]
+
+    assert calls == ["/effort high"]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_ignores_unsupported_effort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An effort outside Claude's vocabulary must not become a slash command."""
+    slash_calls: list[str] = []
+    message_calls: list[str] = []
+
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_slash_command",
+        lambda _bridge, *, command, **_kwargs: slash_calls.append(command),
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        lambda _bridge, *, content, **_kwargs: message_calls.append(content),
+    )
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(extra={"reasoning_effort": "ultra"}),
+        )
+    ]
+
+    assert slash_calls == []
+    assert message_calls == ["hello"]
+    assert events == [TurnComplete(response=None)]
+
+
+@pytest.mark.asyncio
 async def test_run_turn_uses_the_custom_model_slot_id_verbatim(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

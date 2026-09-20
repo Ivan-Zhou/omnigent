@@ -3741,28 +3741,19 @@ async def test_external_idle_status_makes_required_terminal_exit_clean(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_events_effort_change_on_native_session_types_slash_command(
+async def test_events_effort_change_on_native_session_defers_slash_command_to_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    POST ``/events`` with ``{"type":"effort_change","effort":"high"}``
-    on a claude-native session injects ``/effort high`` into tmux.
+    Claude-native remembers an effort change without writing directly to tmux.
 
-    With the unified-effort refactor Omnigent server no longer POSTs to
-    ``/claude-native-effort`` — every PATCH effort goes through the
-    generic ``/events`` path. The runner's ``/events`` dispatch must
-    recognize the native harness and route to
-    ``_handle_claude_native_effort_change``, which assembles the
-    slash command and types it into the pane.
-
-    A regression in the dispatch (wrong harness name, missing branch)
-    would fall through to the generic harness-forward and 404, leaving
-    the dropdown click silently ineffective.
+    The next message carries the remembered effort to the executor, which
+    applies ``/effort`` and the prompt under one lock. Typing from this control
+    handler would reintroduce a second process writing to the pane and can
+    erase a first message while Claude is starting.
     """
     from omnigent.runner.app import _session_event_queues_ref
     from omnigent.spec.types import ExecutorSpec
-
-    captured: list[Any] = []
 
     def _fake_inject(
         bridge_dir: Any,
@@ -3772,8 +3763,9 @@ async def test_events_effort_change_on_native_session_types_slash_command(
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
     ) -> None:
-        """Record the call and return without touching tmux."""
-        captured.append((bridge_dir, command, timeout_s, confirm_hint))
+        """Fail if effort_change writes to tmux outside the executor turn."""
+        del bridge_dir, command, timeout_s, auto_confirm, confirm_hint
+        raise AssertionError("effort_change must defer /effort to the executor turn")
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
@@ -3828,35 +3820,10 @@ async def test_events_effort_change_on_native_session_types_slash_command(
                 if isinstance(item, dict):
                     queued_events.append(item)
 
-    # 1) 204 = the dispatch correctly routed to the native handler and
-    # the handler completed cleanly. 404 would mean the dispatch fell
-    # through to the generic harness-forward.
     assert resp.status_code == 204, (
         f"Native effort_change must return 204 from /events; got {resp.status_code}: {resp.text}"
     )
-    # 2) Exactly one inject call. 0 = native dispatch missed (likely
-    # _session_harness_name returned the wrong canonical name); 2+ =
-    # the handler ran twice.
-    assert len(captured) == 1, (
-        f"Expected one inject_slash_command call from native effort_change, got {len(captured)}."
-    )
-    bridge_dir, command, timeout_s, confirm_hint = captured[0]
-    assert bridge_dir == bridge_dir_for_conversation_id("c7e9584b9bb34910a0068521106c1abc")
-    # The effort dialog's own title, not "Switch model?". Watching for the wrong
-    # one would leave the pane wedged behind an unconfirmed modal; watching for
-    # "any dialog" would answer a foreign one (a permission prompt, a picker the
-    # person opened) that rendered while the poll was running.
-    assert confirm_hint == claude_native_bridge.EFFORT_DIALOG_HINT
-    # Body contract: ``/effort high`` is the literal Claude Code's TUI
-    # accepts. A regression in shape (``/efforthigh``, ``effort high``,
-    # missing leading slash) would either 404 on the slash router or
-    # land as plain text in the prompt.
-    assert command == "/effort high", f"Expected '/effort high' literal, got {command!r}."
-    # 1.0s short timeout: missing tmux.json means the pane isn't
-    # attached; persisted effort still applies on next spawn. A 30s
-    # default would hang the Omnigent PATCH whenever the pane is detached.
-    assert timeout_s == 1.0
-    # 3) effort_change is a control signal, not a state change.
+    # effort_change is a control signal, not a state change.
     # Any session.status enqueued here would mislead the Omnigent relay.
     assert queued_events == [], (
         f"effort_change must not publish session events; got "
