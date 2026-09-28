@@ -91,6 +91,10 @@ def test_host_daemon_env_preserves_proxy_vars_and_provider_secret_split(
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "corp")
     monkeypatch.setenv("OPENAI_API_KEY", "local-provider-secret")
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        dict,
+    )
 
     # When
     env = _build_host_daemon_env(server_url=server_url)
@@ -99,6 +103,46 @@ def test_host_daemon_env_preserves_proxy_vars_and_provider_secret_split(
     assert {name: env.get(name) for name in _PROXY_ENV} == _PROXY_ENV
     assert env["DATABRICKS_CONFIG_PROFILE"] == "corp"
     assert ("OPENAI_API_KEY" in env) is keeps_provider_secret
+
+
+def test_remote_host_daemon_preserves_configured_provider_env_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured env credential crosses both remote process boundaries."""
+    # Given
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "configured-provider-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "unconfigured-provider-secret")
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        lambda: {
+            "providers": {
+                "anthropic": {
+                    "kind": "key",
+                    "anthropic": {
+                        "api_key_ref": "env:ANTHROPIC_API_KEY",
+                        "base_url": "https://api.anthropic.com",
+                    },
+                }
+            }
+        },
+    )
+
+    # When
+    daemon_env = _build_host_daemon_env(server_url=_REMOTE_SERVER_URL)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_anthropic",
+        binding_token="binding-anthropic",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    # Then
+    assert daemon_env["ANTHROPIC_API_KEY"] == "configured-provider-secret"
+    assert runner_env["ANTHROPIC_API_KEY"] == "configured-provider-secret"
+    assert "OPENAI_API_KEY" not in daemon_env
+    assert "OPENAI_API_KEY" not in runner_env
 
 
 def test_runner_env_excludes_proxy_vars_by_default() -> None:
@@ -156,6 +200,7 @@ def test_host_slice_key_gate_reaches_daemon_and_runner(
 ) -> None:
     """The host and its spawned runner make the same slice-key decision."""
     monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", enabled)
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
 
     daemon_env = _build_host_daemon_env(server_url=server_url)
     runner_env = _build_runner_env(
@@ -186,6 +231,7 @@ def test_host_daemon_env_preserves_claude_tool_search_flags(
     # Given
     for name, value in _CLAUDE_TOOL_SEARCH_ENV.items():
         monkeypatch.setenv(name, value)
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
 
     # When
     env = _build_host_daemon_env(server_url=server_url)
@@ -242,6 +288,7 @@ def test_host_daemon_env_preserves_gcloud_adc_selectors(
     # Given
     for name, value in _GCLOUD_ADC_ENV.items():
         monkeypatch.setenv(name, value)
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
 
     # When
     env = _build_host_daemon_env(server_url=server_url)
@@ -291,6 +338,7 @@ def test_host_daemon_env_strips_gcloud_auth_tokens(
     # Given
     for name, value in _GCLOUD_TOKEN_ENV.items():
         monkeypatch.setenv(name, value)
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
 
     # When
     env = _build_host_daemon_env(server_url=server_url)
@@ -327,6 +375,7 @@ def test_host_daemon_env_preserves_claude_telemetry_opt_in(
     # Given
     monkeypatch.setenv("CLAUDE_CODE_ENABLE_TELEMETRY", "1")
     monkeypatch.setenv("OTEL_METRICS_EXPORTER", "otlp")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
 
     # When
     env = _build_host_daemon_env(server_url=server_url)
