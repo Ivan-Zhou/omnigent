@@ -2376,6 +2376,7 @@ def test_dispatch_trace_context_reaches_runner_but_not_daemon(
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv(DISPATCH_TRACEPARENT_ENV_VAR, traceparent)
     monkeypatch.setenv(DISPATCH_TRACESTATE_ENV_VAR, "vendor=abc")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
     for server_url in (None, "https://example.databricksapps.com"):
         daemon_env = _build_host_daemon_env(server_url=server_url)
         assert DISPATCH_TRACEPARENT_ENV_VAR not in daemon_env
@@ -2400,6 +2401,7 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
     monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "DATABRICKS_LINEAR_API_KEY")
     monkeypatch.setenv("DATABRICKS_LINEAR_API_KEY", "lin-secret")
     monkeypatch.setenv("DATABRICKS_UNNAMED", "should-not-forward")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
 
     server = "https://example.databricksapps.com"
     daemon_env = _build_host_daemon_env(server_url=server)

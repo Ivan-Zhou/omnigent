@@ -250,6 +250,7 @@ def test_build_host_daemon_env_local_preserves_server_credentials(
     monkeypatch.setenv("OMNIGENT_DATABASE_URI", "postgresql://u:pw@h/db")
     monkeypatch.setenv("GITHUB_TOKEN", "unrelated-github-secret")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "unrelated-aws-secret")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
 
     env = _build_host_daemon_env(server_url=None)
     empty_string_env = _build_host_daemon_env(server_url="")
@@ -275,6 +276,7 @@ def test_build_host_daemon_env_local_forwards_bedrock_skip_auth(
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
     monkeypatch.setenv("CLAUDE_CODE_SKIP_BEDROCK_AUTH", "1")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
 
     env = _build_host_daemon_env(server_url=None)
 
@@ -282,15 +284,19 @@ def test_build_host_daemon_env_local_forwards_bedrock_skip_auth(
     assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
 
 
-def test_build_host_daemon_env_remote_strips_provider_credentials(
+def test_build_host_daemon_env_remote_strips_unconfigured_provider_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Remote daemon env remains allowlisted and does not carry LLM keys."""
+    """Remote daemon env does not carry unconfigured LLM keys."""
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://example.databricks.com/serving-endpoints")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
     monkeypatch.setenv("DATABRICKS_TOKEN", "test-databricks-token")
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        dict,
+    )
 
     env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
 
@@ -309,6 +315,7 @@ def test_build_host_daemon_env_remote_preserves_host_identity(
     monkeypatch.setenv("OMNIGENT_HOST_ID", "d6d0ccebce7b4b706d21e23696bb462a")
     monkeypatch.setenv("OMNIGENT_HOST_NAME", "isolated-host")
     monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "managed-token")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
 
     env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
 
@@ -331,6 +338,7 @@ def test_build_host_daemon_env_remote_keeps_runner_env_passthrough(
     """
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "MY_GATEWAY_TOKEN")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
 
     env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
 

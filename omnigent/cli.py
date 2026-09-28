@@ -3522,6 +3522,7 @@ def _build_host_daemon_env(
         such as ``None`` / ``""`` for local daemon mode.
     :returns: Environment dict for ``subprocess.Popen``.
     """
+    from omnigent.errors import OmnigentError
     from omnigent.host.connect import (
         _RUNNER_ENV_ALLOWLIST,
         _RUNNER_ENV_ALLOWLIST_PREFIXES,
@@ -3539,6 +3540,15 @@ def _build_host_daemon_env(
             HOST_TOKEN_ENV_VAR,
         }
     )
+    from omnigent.onboarding.provider_config import (
+        load_config,
+        provider_credential_env_vars,
+    )
+
+    try:
+        configured_provider_env_vars = provider_credential_env_vars(load_config())
+    except (OSError, OmnigentError):
+        configured_provider_env_vars = frozenset()
 
     if not server_url:
         daemon_env_prefixes = (*_RUNNER_ENV_ALLOWLIST_PREFIXES, *_LOCAL_DAEMON_ENV_PREFIXES)
@@ -3549,6 +3559,7 @@ def _build_host_daemon_env(
             or key in _LOCAL_DAEMON_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key in identity_env_vars
+            or key in configured_provider_env_vars
             or key.startswith(daemon_env_prefixes)
         }
     else:
@@ -3563,6 +3574,7 @@ def _build_host_daemon_env(
             if key in _RUNNER_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
             or key in identity_env_vars
+            or key in configured_provider_env_vars
             or key.startswith(daemon_env_prefixes)
         }
     # The daemon outlives the dispatch that spawned it and is reused by later
