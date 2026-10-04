@@ -123,37 +123,86 @@ def _bridge_marker(session_id: str) -> str:
     return f"pi-native/{digest}"
 
 
+def _read_argv(pid: int | str) -> list[str]:
+    """Return the ``/proc`` argv of *pid*, or ``[]`` if it is gone/unreadable.
+
+    :param pid: Process id, e.g. ``33086``.
+    :returns: The decoded argv tokens.
+    """
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [chunk.decode(errors="replace") for chunk in raw.split(b"\x00") if chunk]
+
+
+def _find_marker_tmux_socket(marker: str) -> str | None:
+    """Return the ``-S`` socket of the tmux server whose command names *marker*.
+
+    The tmux server keeps its launch argv (``tmux -S <sock> ... new-session
+    ... '<pi command>'``), so it still names the bridge marker after pi has
+    rewritten its own cmdline.
+
+    :param marker: The ``pi-native/<hash>`` bridge segment.
+    :returns: The socket path, or ``None`` if no such tmux server exists yet.
+    """
+    for pid_dir in Path("/proc").iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        argv = _read_argv(pid_dir.name)
+        if not argv or not os.path.basename(argv[0]).startswith("tmux"):
+            continue
+        if "-S" in argv[:-1] and any(marker in arg for arg in argv):
+            return argv[argv.index("-S") + 1]
+    return None
+
+
+def _child_pids(pid: int) -> list[int]:
+    """Return the direct children of *pid* (all threads), or ``[]``.
+
+    :param pid: Parent process id.
+    :returns: Child pids.
+    """
+    children: list[int] = []
+    for task in Path(f"/proc/{pid}/task").glob("*"):
+        with contextlib.suppress(OSError):
+            children.extend(int(c) for c in (task / "children").read_text().split())
+    return children
+
+
 def _find_pi_process(marker: str) -> tuple[int, list[str]] | None:
-    """Scan ``/proc`` for the launched ``pi`` CLI naming *marker*.
+    """Locate the launched ``pi`` CLI through its tmux pane.
 
-    The pi CLI runs as ``node .../pi --extension <bridge>/... --approve
-    --session-dir <bridge>/...``. Two *other* processes also name the bridge
-    marker and must be skipped: the ``tmux new-session ... '<pi command>'``
-    launcher (which embeds the whole pi command as ONE argv element, so
-    ``--extension`` is not a standalone token there) and the ``python -m
-    omnigent.runner...`` runner that spawned it.
-
-    Match only the process where ``--extension`` is its own argv token and
-    ``argv[0]`` is not tmux -- that is the real pi CLI.
+    pi sets ``process.title = "pi"`` at startup, which overwrites its
+    ``/proc/<pid>/cmdline`` and erases the bridge marker, so a cmdline scan
+    only finds it in a brief window after exec. Instead, find the tmux server
+    that names *marker*, ask it for ``#{pane_pid}``, and return the pi/node
+    process at or under that pid.
 
     :param marker: The ``pi-native/<hash>`` bridge segment.
     :returns: ``(pid, argv)`` of the pi process, or ``None`` if not found yet.
     """
-    needle = marker.encode()
-    for pid_dir in Path("/proc").iterdir():
-        if not pid_dir.name.isdigit():
-            continue
-        try:
-            raw = (pid_dir / "cmdline").read_bytes()
-        except OSError:
-            continue
-        if needle not in raw:
-            continue
-        argv = [chunk.decode(errors="replace") for chunk in raw.split(b"\x00") if chunk]
-        if not argv:
-            continue
-        if "--extension" in argv and not os.path.basename(argv[0]).startswith("tmux"):
-            return int(pid_dir.name), argv
+    socket_path = _find_marker_tmux_socket(marker)
+    if socket_path is None:
+        return None
+    try:
+        probe = subprocess.run(
+            ["tmux", "-S", socket_path, "display-message", "-p", "-t", "main", "#{pane_pid}"],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if probe.returncode != 0 or not probe.stdout.strip().isdigit():
+        return None
+    pending = [int(probe.stdout.strip())]
+    while pending:
+        pid = pending.pop(0)
+        argv = _read_argv(pid)
+        if argv and os.path.basename(argv[0]) in ("pi", "node"):
+            return pid, argv
+        pending.extend(_child_pids(pid))
     return None
 
 
@@ -214,8 +263,10 @@ def _capture_terminal_panes() -> str:
 def _kill_pi_processes(marker: str) -> None:
     """Best-effort SIGKILL of any process still naming *marker*.
 
-    :param marker: The bridge segment; kills the pi CLI and any child that
-        inherited it so the test leaves no orphaned tmux/pi tree.
+    Once pi has retitled itself this is mainly the tmux server; killing it
+    hangs up the pane, so the test leaves no orphaned tmux/pi tree.
+
+    :param marker: The ``pi-native/<hash>`` bridge segment.
     """
     needle = marker.encode()
     for pid_dir in Path("/proc").iterdir():
@@ -230,19 +281,33 @@ def _kill_pi_processes(marker: str) -> None:
                 os.kill(int(pid_dir.name), signal.SIGKILL)
 
 
-def _scan_home_logs_for(home: Path, pattern: re.Pattern[str]) -> str | None:
-    """Return the first log line under *home* matching *pattern*, else ``None``.
+def _session_log_paths(home: Path, session_id: str) -> list[Path]:
+    """Return the ``*.log`` files under *home* that belong to *session_id*.
+
+    The runner logs per session as ``runner-<session_id>-<ts>.log``. The
+    daemon HOME is module-scoped, so a rerun must not read the previous
+    attempt's logs.
+
+    :param home: The daemon HOME whose ``.omnigent/logs`` tree holds the logs.
+    :param session_id: The session/conversation id.
+    :returns: Matching log paths.
+    """
+    return [path for path in home.rglob("*.log") if session_id in path.name]
+
+
+def _scan_session_logs_for(home: Path, session_id: str, pattern: re.Pattern[str]) -> str | None:
+    """Return the first *session_id* log line matching *pattern*, else ``None``.
 
     The "tmux unavailable ... pi:main" signature is emitted by the RUNNER
     process (the idle-watcher daemon thread), whose process log lands under
-    ``<home>/.omnigent/logs/runner/``. Scanning every ``*.log`` under the
-    daemon HOME finds it wherever the runner routed it.
+    ``<home>/.omnigent/logs/runner/``.
 
     :param home: The daemon HOME whose ``.omnigent/logs`` tree holds the logs.
+    :param session_id: The session/conversation id under test.
     :param pattern: The compiled signature regex.
     :returns: The matching line, or ``None``.
     """
-    for log_path in home.rglob("*.log"):
+    for log_path in _session_log_paths(home, session_id):
         try:
             text = log_path.read_text(errors="replace")
         except OSError:
@@ -546,7 +611,7 @@ def test_pi_main_terminal_survives_pi_exit_without_tmux_unavailable(
         terminal_gone = False
         scan_deadline = time.monotonic() + 25.0
         while time.monotonic() < scan_deadline:
-            hit = _scan_home_logs_for(host.home, _TMUX_UNAVAILABLE_RE)
+            hit = _scan_session_logs_for(host.home, session_id, _TMUX_UNAVAILABLE_RE)
             if hit is not None:
                 signature_line = hit
                 break
@@ -563,13 +628,17 @@ def test_pi_main_terminal_survives_pi_exit_without_tmux_unavailable(
             "pi:main terminal never exited after the pi CLI was killed -- the "
             "exit path was not exercised, so the reproduction is inconclusive."
         )
+        # Guard against a vacuous pass if the runner's per-session log name changes.
+        assert _session_log_paths(host.home, session_id), (
+            f"no runner log names session {session_id!r} under {host.home}; "
+            "the signature scan had nothing to read."
+        )
 
         # The reproduction / regression assertion.
         assert signature_line is None, (
-            "Bug reproduced: killing the pi CLI vaporized the pi:main "
-            "tmux server (launched without keep_alive_after_exit), and the idle "
-            "watcher logged the generic tmux-unavailable signature instead of a "
-            f"diagnosable pane-dead exit:\n    {signature_line}"
+            "Bug reproduced: killing the pi CLI made the pi:main tmux server "
+            "vanish, and the idle watcher logged the generic tmux-unavailable "
+            f"signature instead of a diagnosable pane-dead exit:\n    {signature_line}"
         )
     finally:
         _kill_pi_processes(marker)
