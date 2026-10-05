@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # Guarded wrapper around `swift format`, invoked by the web-ios-swift-*
-# pre-commit hooks. Developers run pre-commit on macOS where the Swift
-# toolchain (and thus `swift format`) ships with Xcode, but the shared CI
-# "Pre-commit checks" job runs on ubuntu-latest with no Swift installed.
-# Skip cleanly there so `pre-commit run --all-files` stays green; real
-# enforcement is local (macOS) by design.
+# pre-commit hooks. Skips cleanly on machines without a Swift toolchain so
+# `pre-commit run --all-files` stays green there. Xcode and the ubuntu-latest
+# CI image both ship one, so the hooks enforce in both places.
 set -euo pipefail
 
 if ! command -v swift >/dev/null 2>&1; then
