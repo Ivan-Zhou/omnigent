@@ -96,7 +96,7 @@ jobs:
     name: build codex-parity sidecar
     needs: setup
     if: needs.setup.outputs.matrix != '{"include":[]}'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -112,14 +112,14 @@ jobs:
       # is a pure function of sidecar/** + the toolchain. Cache the built binary
       # (not the 1.6 GB target dir) and skip the ~7 min compile below on a hit;
       # the key self-invalidates when the source, Cargo.lock, or rustc changes.
-      # Same key as ci.yml's codex-parity job -- ci.yml runs on push to main and
-      # populates the main-scoped cache that this PR-only workflow restores from.
+      # Include the runner image: binaries built on newer glibc cannot run
+      # on the Ubuntu version used by the browser-test shards.
       - name: Cache parity sidecar binary
         id: sidecar-cache
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
         with:
           path: .tmp-codex-parity-target/debug/codex-parity-sidecar
-          key: codex-parity-bin-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
+          key: codex-parity-bin-ubuntu-24.04-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
       - name: Build parity sidecar
         if: steps.sidecar-cache.outputs.cache-hit != 'true'
         run: |
@@ -140,7 +140,7 @@ jobs:
     # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
     # `ready_for_review` re-fires when a draft is converted.
     needs: [setup, build-sidecar]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
@@ -173,7 +173,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
         with:
           path: .venv
-          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+          key: venv-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
       - name: Install project + test dependencies
         run: uv sync --locked --extra all --group test
 
