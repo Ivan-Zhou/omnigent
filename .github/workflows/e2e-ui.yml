@@ -207,9 +207,9 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
         with:
           path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('uv.lock') }}
+          key: ubuntu-24.04-${{ runner.arch }}-playwright-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            ${{ runner.os }}-playwright-
+            ubuntu-24.04-${{ runner.arch }}-playwright-
 
       - name: Install Playwright Chromium
         run: |
