@@ -217,8 +217,8 @@ def pi_session_records_from_session_items(
     - user ``message`` -> Pi ``message`` with ``role: "user"``.
     - assistant ``message`` -> Pi ``message`` with ``role: "assistant"`` and a
       text content block.
-    - ``function_call`` -> Pi ``message`` with ``role: "assistant"`` whose
-      content carries a ``toolCall`` block.
+    - ``function_call`` -> Pi assistant ``toolCall`` block. Consecutive
+      assistant items in one response share a message before their results.
     - ``function_call_output`` -> Pi ``message`` with ``role: "toolResult"``.
 
     Interrupted assistant turns (and the rest of their response group) are
@@ -246,8 +246,8 @@ def pi_session_records_from_session_items(
         "cwd": str(cwd),
     }
     records: list[_JsonObject] = [header]
-    parent_id: str | None = None
     skip_response_ids = _interrupted_response_ids(items)
+    previous_response_id: object = None
 
     for index, item in enumerate(items):
         response_id = item.get("response_id")
@@ -263,10 +263,65 @@ def pi_session_records_from_session_items(
             model=model,
         )
         for entry in entries:
-            entry["parentId"] = parent_id
+            message = cast(_JsonObject, entry["message"])
+            previous = records[-1].get("message")
+            if (
+                message.get("role") == "assistant"
+                and isinstance(previous, dict)
+                and previous.get("role") == "assistant"
+                and previous_response_id == response_id
+            ):
+                # Pi closes each assistant's tool calls before the next assistant.
+                # Splitting a parallel batch makes it invent results before the real ones.
+                cast(list[_JsonObject], previous["content"]).extend(
+                    cast(list[_JsonObject], message["content"])
+                )
+                if message["stopReason"] == "toolUse":
+                    previous["stopReason"] = "toolUse"
+                continue
             records.append(entry)
-            parent_id = cast(str, entry["id"])
-    return records
+            previous_response_id = response_id
+    return _pi_order_tool_results(records)
+
+
+def _pi_order_tool_results(records: list[_JsonObject]) -> list[_JsonObject]:
+    """Keep tool results adjacent to their assistant before relinking the history.
+
+    User messages can arrive while tools are running. Pi closes pending tools
+    when it sees a user message, so replay those messages after the results.
+
+    :param records: Synthesized session header and message entries.
+    :returns: Records with interleaved users deferred and a linear parent chain.
+    """
+    ordered = [records[0]]
+    deferred_users: list[_JsonObject] = []
+    pending: set[str] = set()
+    for record in records[1:]:
+        message = cast(_JsonObject, record["message"])
+        role = message["role"]
+        if role == "user" and pending:
+            deferred_users.append(record)
+            continue
+        if role == "assistant":
+            ordered.extend(deferred_users)
+            deferred_users.clear()
+            pending = {
+                cast(str, block["id"])
+                for block in cast(list[_JsonObject], message["content"])
+                if block.get("type") == "toolCall"
+            }
+        ordered.append(record)
+        if role == "toolResult":
+            pending.discard(cast(str, message["toolCallId"]))
+            if not pending:
+                ordered.extend(deferred_users)
+                deferred_users.clear()
+    ordered.extend(deferred_users)
+    parent_id: str | None = None
+    for record in ordered[1:]:
+        record["parentId"] = parent_id
+        parent_id = cast(str, record["id"])
+    return ordered
 
 
 def _pi_entries_from_session_item(
@@ -422,7 +477,9 @@ def _pi_assistant_message(
                 "total": 0,
             },
         },
-        "stopReason": "stop",
+        "stopReason": "toolUse"
+        if any(block.get("type") == "toolCall" for block in content)
+        else "stop",
         "timestamp": 0,
     }
 

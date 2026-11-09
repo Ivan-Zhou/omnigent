@@ -223,6 +223,73 @@ def test_full_tool_roundtrip_chains_correctly() -> None:
         assert cur["parentId"] == prev["id"]
 
 
+@pytest.mark.parametrize("with_text", [False, True])
+def test_parallel_tool_calls_share_one_assistant_message(with_text: bool) -> None:
+    items = [_user_item("Inspect both files.")]
+    if with_text:
+        items.append(_assistant_item("I will read both files."))
+    items.extend(
+        [
+            _function_call_item(
+                name="read", call_id="c1", arguments='{"path":"a"}', item_id="fc1"
+            ),
+            _function_call_item(
+                name="read", call_id="c2", arguments='{"path":"b"}', item_id="fc2"
+            ),
+            _function_output_item(call_id="c2", output="second file", item_id="fo2"),
+            _function_output_item(call_id="c1", output="first file", item_id="fo1"),
+            _assistant_item("Both files inspected.", item_id="a2"),
+        ]
+    )
+    records = pi_session_records_from_session_items(
+        items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
+    )
+    entries = records[1:]
+    assert [e["message"]["role"] for e in entries] == [
+        "user",
+        "assistant",
+        "toolResult",
+        "toolResult",
+        "assistant",
+    ]
+    assistant = entries[1]["message"]
+    assert [b["id"] for b in assistant["content"] if b["type"] == "toolCall"] == ["c1", "c2"]
+    assert assistant["stopReason"] == "toolUse"
+    assert [e["message"]["toolCallId"] for e in entries[2:4]] == ["c2", "c1"]
+    if with_text:
+        assert assistant["content"][0] == {"type": "text", "text": "I will read both files."}
+    for previous, current in itertools.pairwise(entries):
+        assert current["parentId"] == previous["id"]
+
+
+def test_user_message_during_parallel_tools_follows_their_results() -> None:
+    items = [
+        _user_item("Inspect both files."),
+        _function_call_item(name="read", call_id="c1", arguments="{}", item_id="fc1"),
+        _function_call_item(name="read", call_id="c2", arguments="{}", item_id="fc2"),
+        _function_output_item(call_id="c1", output="first", item_id="fo1"),
+        _user_item("Also summarize them.", item_id="u2", response_id="r2"),
+        _function_output_item(call_id="c2", output="second", item_id="fo2"),
+        _assistant_item("Summary.", item_id="a2", response_id="r2"),
+    ]
+    records = pi_session_records_from_session_items(
+        items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
+    )
+    entries = records[1:]
+    assert [e["message"]["role"] for e in entries] == [
+        "user",
+        "assistant",
+        "toolResult",
+        "toolResult",
+        "user",
+        "assistant",
+    ]
+    assert entries[4]["message"]["content"] == [{"type": "text", "text": "Also summarize them."}]
+    assert [e["message"]["toolCallId"] for e in entries[2:4]] == ["c1", "c2"]
+    for previous, current in itertools.pairwise(entries):
+        assert current["parentId"] == previous["id"]
+
+
 def test_empty_text_items_are_dropped() -> None:
     items = [
         {"id": "u1", "type": "message", "role": "user", "content": []},

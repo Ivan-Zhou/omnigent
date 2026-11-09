@@ -42,7 +42,7 @@ jobs:
     name: Pre-commit checks
     needs: gate
     if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     steps:
@@ -69,7 +69,7 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
         with:
           path: .venv
-          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
+          key: venv-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install dependencies
         # `--locked` is the hard gate: fails if uv.lock is out of sync with
