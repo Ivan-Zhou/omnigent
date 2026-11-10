@@ -64,7 +64,10 @@ jobs:
   # runs on schedule/dispatch and covers the broader version history.
   resolve-latest:
     name: Resolve latest stable tag
-    # PRs: always. Schedule/dispatch: always.
+    # PRs and dispatch: always. Schedule: canonical repository only, so forks
+    # don't run (and email about) the 12-hourly sweep. Every downstream job
+    # needs this one or setup/setup-ui, so skipping all three skips the run.
+    if: ${{ github.event_name != 'schedule' || github.repository == 'omnigent-ai/omnigent' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -162,8 +165,9 @@ jobs:
   setup:
     name: setup
     # The full pairwise matrix is expensive — skip it on PR triggers (the
-    # fast smoke jobs above cover the PR case).
-    if: github.event_name != 'pull_request'
+    # fast smoke jobs above cover the PR case). Schedule: canonical repository
+    # only (see resolve-latest).
+    if: ${{ github.event_name != 'pull_request' && (github.event_name != 'schedule' || github.repository == 'omnigent-ai/omnigent') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -256,7 +260,8 @@ jobs:
   # tests/e2e_ui for every old server tag × shard (server axis only).
   setup-ui:
     name: setup-ui
-    if: github.event_name != 'pull_request'
+    # Same trigger gate as setup.
+    if: ${{ github.event_name != 'pull_request' && (github.event_name != 'schedule' || github.repository == 'omnigent-ai/omnigent') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
