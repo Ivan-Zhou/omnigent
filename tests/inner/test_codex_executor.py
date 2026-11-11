@@ -3,15 +3,19 @@
 import asyncio
 import base64
 import contextlib
+import errno
 import json
 import os
 import stat
+import sys
 import tempfile
 import unittest
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -23,19 +27,23 @@ from omnigent.inner.codex_executor import (
     _codex_builtin_tool_completion,
     _codex_cli_version,
     _CodexAppServerSession,
+    _CodexSessionState,
     _databricks_codex_config_overrides,
     _dynamic_tool_result_payload,
     _goal_objective_from_content,
     _parse_codex_gateway_error,
     _prompt_for_turn,
     _provider_codex_config_overrides,
+    _require_brokered_codex_version,
     _to_codex_input_items,
 )
 from omnigent.inner.codex_goal_command import (
     GOAL_OBJECTIVE_MAX_CHARS,
     goal_objective_length_error,
 )
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
+    ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
     TextChunk,
@@ -44,9 +52,18 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
-from omnigent.models.codex_model_vocabulary import codex_spawn_model
-from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
+from omnigent.inner.model_auth import ProviderAuthRequired
+from omnigent.inner.model_egress import FrozenModelRoute
+from omnigent.inner.model_signer import SignerLaunchConfig, SubprocessModelSigner
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+
+
+@pytest.fixture(autouse=True)
+def _isolate_codex_config_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._start_codex_model_discovery_process",
+        AsyncMock(side_effect=OSError("no installed CLI in executor unit tests")),
+    )
 
 
 def _run(coro):
@@ -105,6 +122,30 @@ class _FakePipe:
         return b""
 
 
+class _ScriptedStdoutPipe(_FakePipe):
+    """Stdout that emits scripted frames, then stays open like a live server.
+
+    The prompt stdout-EOF recovery turns an immediate EOF into
+    ``HarnessTransportClosedError``, and ``start()`` resets ``_events``,
+    so tests that drive the real ``start()`` must deliver events through
+    the reader and keep stdout open until ``close()`` cancels the reader
+    task.
+    """
+
+    def __init__(self, lines: list[bytes]) -> None:
+        super().__init__()
+        self._lines = list(lines)
+
+    async def read(self, n: int) -> bytes:
+        if self._lines:
+            return self._lines.pop(0)
+        await asyncio.Event().wait()
+        return b""
+
+    async def readline(self) -> bytes:
+        return await self.read(-1)
+
+
 class _OverflowingPipe:
     def __init__(self):
         self.read_calls = 0
@@ -133,7 +174,9 @@ class _FakeProcess:
         self.stderr = _FakePipe()
         self.returncode: int | None = None
         self.terminated = False
-        self.pid = 12345
+        # Above Linux's PID_MAX_LIMIT (2**22), so the real terminate_tree these
+        # tests reach can never signal a live process on the test machine.
+        self.pid = 2**22 + 1
 
     def terminate(self) -> None:
         self.terminated = True
@@ -160,6 +203,7 @@ class TestCodexExecutor(unittest.TestCase):
         self.assertFalse(any("/serving-endpoints" in item for item in overrides))
         self.assertTrue(any('auth={command="sh"' in item for item in overrides))
         self.assertTrue(any("databricks auth token --host" in item for item in overrides))
+        self.assertTrue(any("timeout_ms=15000" in item for item in overrides))
         self.assertTrue(any("refresh_interval_ms=900000" in item for item in overrides))
         self.assertFalse(any('env_key="DATABRICKS_TOKEN"' in item for item in overrides))
 
@@ -370,6 +414,29 @@ class TestCodexExecutor(unittest.TestCase):
         prompt = _prompt_for_turn(messages, is_new_thread=False)
         self.assertEqual(prompt, "Summarize our conversation.")
 
+    def test_build_initial_prompt_keeps_user_attachments_as_native_blocks(self):
+        # A fresh thread replaying multimodal history must keep image bytes as
+        # native input_image blocks, not flatten the data URI into prompt text.
+        uri = "data:image/png;base64,QUJD"
+        messages = [
+            {"role": "user", "content": [{"type": "input_image", "image_url": uri}]},
+            {"role": "assistant", "content": "Saw it."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Compare."},
+                    {"type": "input_image", "image_url": uri},
+                ],
+            },
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        images = [item for item in wire if item["type"] == "image"]
+        self.assertEqual(images, [{"type": "image", "url": uri}, {"type": "image", "url": uri}])
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertNotIn(uri, text)
+
     def test_goal_objective_requires_a_standalone_command(self):
         self.assertEqual(
             _goal_objective_from_content("  /goal Finish the implementation  "),
@@ -443,9 +510,8 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertIsInstance(events[2], ToolCallComplete)
             self.assertIsInstance(events[3], TurnComplete)
             self.assertEqual(fake_session.calls[0]["system_prompt"], "Be helpful.")
-            # Codex's own login defaults from codex's catalog, not the generic
-            # OpenAI one, whose newest row is a family alias codex rejects.
-            self.assertEqual(fake_session.calls[0]["model"], CODEX_DEFAULT_MODEL)
+            # Codex's own login leaves the model to codex.
+            self.assertIsNone(fake_session.calls[0]["model"])
             self.assertEqual(fake_session.calls[0]["tools"][0]["name"], "calculate")
 
         _run(_t())
@@ -513,7 +579,7 @@ class TestCodexExecutor(unittest.TestCase):
         _run(_t())
 
     def test_app_server_run_turn_keeps_native_shell_by_default(self):
-        async def _t():
+        async def _t(supports_direct_tools: bool):
             session = _CodexAppServerSession(
                 codex_path="/bin/echo",
                 cwd="/tmp/workspace",
@@ -521,6 +587,7 @@ class TestCodexExecutor(unittest.TestCase):
                 tool_executor=None,
             )
             session.start = AsyncMock()
+            session._supports_direct_tool_namespaces = supports_direct_tools
             session._proc = _FakeProcess()
             session._request = AsyncMock(
                 side_effect=[
@@ -573,10 +640,21 @@ class TestCodexExecutor(unittest.TestCase):
 
             thread_start_call = session._request.await_args_list[0]
             params = thread_start_call.args[1]
-            self.assertNotIn("shell_tool", params["config"]["features"])
+            self.assertNotIn("features.shell_tool", params["config"])
+            if supports_direct_tools:
+                self.assertEqual(
+                    params["config"]["features.code_mode.direct_only_tool_namespaces"],
+                    ["functions"],
+                )
+            else:
+                self.assertNotIn(
+                    "features.code_mode.direct_only_tool_namespaces", params["config"]
+                )
             self.assertEqual(params["dynamicTools"][0]["name"], "sys_os_shell")
 
-        _run(_t())
+        for supports_direct_tools in (False, True):
+            with self.subTest(supports_direct_tools=supports_direct_tools):
+                _run(_t(supports_direct_tools))
 
     def test_app_server_run_turn_starts_goal_before_objective_turn(self):
         async def _t():
@@ -624,6 +702,7 @@ class TestCodexExecutor(unittest.TestCase):
                 [call.args[0] for call in calls],
                 ["thread/start", "thread/goal/set", "turn/start"],
             )
+            self.assertNotIn("modelProvider", calls[0].args[1])
             self.assertEqual(
                 calls[1].args[1],
                 {"threadId": "thread-1", "objective": "Finish and test"},
@@ -631,6 +710,51 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertEqual(
                 calls[2].args[1]["input"],
                 [{"type": "text", "text": "Finish and test"}],
+            )
+
+        _run(_t())
+
+    def test_brokered_app_server_pins_provider_on_thread_start(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+                thread_model_provider="omnigent_brokered",
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    {"result": {"turn": {"id": "turn-1"}}},
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            async for _event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+            ):
+                pass
+            await inject_task
+
+            thread_start = session._request.await_args_list[0]
+            self.assertEqual(thread_start.args[0], "thread/start")
+            self.assertEqual(
+                thread_start.args[1]["modelProvider"],
+                "omnigent_brokered",
             )
 
         _run(_t())
@@ -754,121 +878,196 @@ class TestCodexExecutor(unittest.TestCase):
         _run(_t())
 
     def test_app_server_run_turn_applies_effort_via_thread_settings_update(self):
-        """Reasoning effort rides thread/settings/update, not turn/start.
-
-        Codex's ``TurnStartParams`` has no ``effort`` field, so an effort set
-        on ``turn/start`` is silently dropped by serde and never takes effect.
-        It must go through ``thread/settings/update`` (whose
-        ``ThreadSettingsUpdateParams`` carries ``effort``) — the same path the
-        TUI ``/model`` picker uses.
-        """
-
-        async def _t():
-            session = _CodexAppServerSession(
-                codex_path="/bin/echo",
-                cwd="/tmp/workspace",
-                env={},
-                tool_executor=None,
-            )
-            session.start = AsyncMock()
-            session._proc = _FakeProcess()
-            session._request = AsyncMock(
-                side_effect=[
-                    {"result": {"thread": {"id": "thread-1"}}},  # thread/start
-                    {"result": {}},  # thread/settings/update
-                    {"result": {"turn": {"id": "turn-1"}}},  # turn/start
-                ]
-            )
-
-            async def _inject_turn_completed() -> None:
-                await asyncio.sleep(0.01)
-                session._events.put_nowait(
-                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
-                )
-
-            inject_task = asyncio.create_task(_inject_turn_completed())
-            # Drive the turn to completion (consume the event stream for its
-            # side effects — the RPCs we assert on below).
-            async for _event in session.run_turn(
-                messages=[{"role": "user", "content": "hi"}],
-                tools=[],
-                system_prompt="",
-                model="gpt-5.4-mini",
-                cwd=".",
-                sandbox="workspace-write",
-                reasoning_effort="high",
-            ):
-                pass
-            await inject_task
-
-            methods = [call.args[0] for call in session._request.await_args_list]
-            # Settings update lands BEFORE the turn starts so the effort applies
-            # to this turn, and turn/start carries no (dropped) effort field.
-            self.assertEqual(methods, ["thread/start", "thread/settings/update", "turn/start"])
-            settings_params = session._request.await_args_list[1].args[1]
-            self.assertEqual(
-                settings_params,
-                {
-                    "threadId": "thread-1",
-                    "effort": "high",
-                    "summary": "detailed",
-                },
-            )
-            turn_params = session._request.await_args_list[2].args[1]
-            self.assertNotIn("effort", turn_params)
-
-        _run(_t())
+        """Explicit effort and Default both update the existing thread."""
+        for configured_default in (None, "xhigh"):
+            with self.subTest(configured_default=configured_default):
+                _run(self._assert_app_server_effort_transitions(configured_default))
 
     def test_app_server_run_turn_falls_back_when_settings_update_is_unsupported(self):
         """Older app-server builds accept effort only on ``turn/start``."""
+        for configured_default in (None, "xhigh"):
+            with self.subTest(configured_default=configured_default):
+                _run(
+                    self._assert_app_server_effort_transitions(
+                        configured_default, supports_settings=False
+                    )
+                )
 
-        async def _t():
+    async def _assert_app_server_effort_transitions(
+        self, configured_default: str | None, *, supports_settings: bool = True
+    ):
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+        )
+        session.start = AsyncMock()
+        session._proc = _FakeProcess()
+        default_effort = configured_default or "low"
+        server_effort = default_effort
+        applied_efforts = []
+        turn_count = 0
+
+        async def request(method, params):
+            nonlocal server_effort, turn_count
+            if method == "thread/start":
+                self.assertEqual(params["developerInstructions"], "Keep the passphrase.")
+                self.assertEqual(params["dynamicTools"][0]["name"], "remember")
+                return {
+                    "result": {
+                        "thread": {"id": "thread-1"},
+                        "model": "resolved-model",
+                        "reasoningEffort": configured_default,
+                    }
+                }
+            if method == "model/list":
+                self.assertTrue(params["includeHidden"])
+                if not params.get("cursor"):
+                    return {
+                        "result": {
+                            "data": [{"model": "other-model", "defaultReasoningEffort": "high"}],
+                            "nextCursor": "next-page",
+                        }
+                    }
+                self.assertEqual(params["cursor"], "next-page")
+                return {
+                    "result": {
+                        "data": [{"model": "resolved-model", "defaultReasoningEffort": "low"}],
+                        "nextCursor": None,
+                    }
+                }
+            self.assertEqual(params["threadId"], "thread-1")
+            if method == "thread/settings/update":
+                if not supports_settings:
+                    raise RuntimeError(
+                        "{'code': -32600, 'message': 'Invalid request: unknown variant "
+                        "`thread/settings/update`'}"
+                    )
+                self.assertEqual(params["summary"], "detailed")
+                # Codex maps effort with Option::map(Some): null is a no-op.
+                if params.get("effort") is not None:
+                    server_effort = params["effort"]
+                return {"result": {}}
+            self.assertEqual(method, "turn/start")
+            turn_count += 1
+            self.assertEqual(params["input"], [{"type": "text", "text": f"message-{turn_count}"}])
+            if supports_settings:
+                self.assertNotIn("effort", params)
+            elif params.get("effort") is not None:
+                self.assertEqual(params["summary"], "detailed")
+                server_effort = params["effort"]
+            applied_efforts.append(server_effort)
+            turn = {"id": f"turn-{turn_count}"}
+            asyncio.get_running_loop().call_soon(
+                session._events.put_nowait, {"method": "turn/completed", "params": {"turn": turn}}
+            )
+            return {"result": {"turn": turn}}
+
+        session._request = AsyncMock(side_effect=request)
+        messages = []
+        for index, effort in enumerate((None, "high", "high", None, None, "medium", None), 1):
+            messages.append({"role": "user", "content": f"message-{index}"})
+            async for _ in session.run_turn(
+                messages=messages,
+                tools=[
+                    {
+                        "name": "remember",
+                        "description": "Remember",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+                system_prompt="Keep the passphrase.",
+                model=None,
+                cwd=".",
+                sandbox="workspace-write",
+                reasoning_effort=effort,
+            ):
+                pass
+            messages.append({"role": "assistant", "content": "remembered"})
+            self.assertEqual(server_effort, effort or default_effort, f"turn {index}: {effort=}")
+
+        self.assertEqual(
+            applied_efforts,
+            [
+                default_effort,
+                "high",
+                "high",
+                default_effort,
+                default_effort,
+                "medium",
+                default_effort,
+            ],
+        )
+        methods = [call.args[0] for call in session._request.await_args_list]
+        self.assertEqual(methods.count("thread/start"), 1)
+        self.assertEqual(methods.count("thread/settings/update"), 4)
+        self.assertEqual(methods.count("model/list"), 0 if configured_default else 2)
+        self.assertIsNone(session._applied_effort)
+
+    def test_app_server_run_turn_retries_failed_effort_reset(self):
+        """Failed resets must not start with stale effort or mark Default applied."""
+
+        async def _t(failure):
             session = _CodexAppServerSession(
-                codex_path="/bin/echo",
-                cwd="/tmp/workspace",
-                env={},
-                tool_executor=None,
+                codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
             )
             session.start = AsyncMock()
             session._proc = _FakeProcess()
-            session._request = AsyncMock(
-                side_effect=[
-                    {"result": {"thread": {"id": "thread-1"}}},
-                    RuntimeError(
-                        "{'code': -32600, 'message': 'Invalid request: unknown variant "
-                        "`thread/settings/update`'}"
-                    ),
-                    {"result": {"turn": {"id": "turn-1"}}},
-                ]
-            )
+            session.thread_id = "thread-1"
+            session._thread_model = "resolved-model"
+            session._applied_effort = "high"
+            session._default_effort = None if failure == "catalog" else "low"
+            failing = True
 
-            async def _inject_turn_completed() -> None:
-                await asyncio.sleep(0.01)
-                session._events.put_nowait(
-                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+            async def request(method, params):
+                if method == "model/list":
+                    if failing:
+                        return {"result": {"data": [], "nextCursor": "repeated-cursor"}}
+                    return {
+                        "result": {
+                            "data": [{"model": "resolved-model", "defaultReasoningEffort": "low"}]
+                        }
+                    }
+                if method == "thread/settings/update":
+                    self.assertEqual(params["effort"], "low")
+                    if failure == "legacy turn":
+                        raise RuntimeError("unknown variant `thread/settings/update`")
+                    if failing:
+                        raise RuntimeError("settings rejected")
+                    return {"result": {}}
+                self.assertEqual(method, "turn/start")
+                if failing:
+                    raise RuntimeError("turn rejected")
+                if failure == "legacy turn":
+                    self.assertEqual(params["effort"], "low")
+                asyncio.get_running_loop().call_soon(
+                    session._events.put_nowait,
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}},
                 )
+                return {"result": {"turn": {"id": "turn-1"}}}
 
-            inject_task = asyncio.create_task(_inject_turn_completed())
-            async for _event in session.run_turn(
-                messages=[{"role": "user", "content": "hi"}],
-                tools=[],
-                system_prompt="",
-                model="gpt-5.4-mini",
-                cwd=".",
-                sandbox="workspace-write",
-                reasoning_effort="low",
-            ):
-                pass
-            await inject_task
+            session._request = AsyncMock(side_effect=request)
+            turn_args = {
+                "messages": [{"role": "user", "content": "retry"}],
+                "tools": [],
+                "system_prompt": "",
+                "model": None,
+                "cwd": ".",
+                "sandbox": "workspace-write",
+            }
+            with self.assertRaisesRegex(RuntimeError, "Cannot restore|rejected"):
+                _ = [event async for event in session.run_turn(**turn_args)]
+            self.assertEqual(session._applied_effort, "high")
+            self.assertEqual(session.thread_id, "thread-1")
+            if failure != "legacy turn":
+                self.assertNotIn(
+                    "turn/start", [call.args[0] for call in session._request.await_args_list]
+                )
+            failing = False
+            _ = [event async for event in session.run_turn(**turn_args)]
+            self.assertIsNone(session._applied_effort)
 
-            methods = [call.args[0] for call in session._request.await_args_list]
-            self.assertEqual(methods, ["thread/start", "thread/settings/update", "turn/start"])
-            turn_params = session._request.await_args_list[2].args[1]
-            self.assertEqual(turn_params["effort"], "low")
-            self.assertEqual(turn_params["summary"], "detailed")
-            self.assertEqual(session._applied_effort, "low")
-
-        _run(_t())
+        for failure in ("catalog", "settings", "legacy turn"):
+            with self.subTest(failure=failure):
+                _run(_t(failure))
 
     def test_app_server_run_turn_dedupes_unchanged_effort(self):
         """An unchanged effort is not re-sent on a later turn of one thread.
@@ -1028,7 +1227,7 @@ class TestCodexExecutor(unittest.TestCase):
 
             thread_start_call = session._request.await_args_list[0]
             params = thread_start_call.args[1]
-            self.assertEqual(params["config"]["features"]["shell_tool"], False)
+            self.assertEqual(params["config"]["features.shell_tool"], False)
 
         _run(_t())
 
@@ -1051,7 +1250,7 @@ class TestCodexExecutor(unittest.TestCase):
         _run(_t())
 
     def test_signature_change_recreates_app_session(self):
-        async def _t():
+        async def _t(change_model):
             first = _FakeAppSession([[TurnComplete(response="one")]])
             second = _FakeAppSession([[TurnComplete(response="two")]])
             sessions = [first, second]
@@ -1067,13 +1266,16 @@ class TestCodexExecutor(unittest.TestCase):
                     [{"role": "user", "content": "hi", "session_id": "s1"}],
                     [],
                     "",
+                    config=ExecutorConfig(model="first-model", extra={"reasoning_effort": "high"}),
                 )
             ]
             second_events = [
                 e
                 async for e in executor.run_turn(
                     [{"role": "user", "content": "hi", "session_id": "s1"}],
-                    [
+                    []
+                    if change_model
+                    else [
                         {
                             "name": "sleep",
                             "description": "Sleep",
@@ -1081,6 +1283,7 @@ class TestCodexExecutor(unittest.TestCase):
                         }
                     ],
                     "",
+                    config=ExecutorConfig(model="second-model" if change_model else "first-model"),
                 )
             ]
 
@@ -1088,6 +1291,43 @@ class TestCodexExecutor(unittest.TestCase):
             self.assertEqual(second_events[-1].response, "two")
             self.assertTrue(first.closed)
             self.assertFalse(second.closed)
+            self.assertEqual(first.calls[0]["reasoning_effort"], "high")
+            self.assertIsNone(second.calls[0]["reasoning_effort"])
+            self.assertEqual(
+                second.calls[0]["model"], "second-model" if change_model else "first-model"
+            )
+
+        for change_model in (False, True):
+            with self.subTest(change_model=change_model):
+                _run(_t(change_model))
+
+    def test_signature_change_cannot_replace_incompletely_cleaned_session(self):
+        async def _t():
+            existing = AsyncMock()
+            existing._closing = True
+            existing.cleaned = False
+            factory = AsyncMock()
+            executor = CodexExecutor(
+                codex_path="/bin/echo",
+                app_session_factory=factory,
+            )
+            state = _CodexSessionState(
+                app_session=existing,
+                signature=(None, "old", "old", "old"),
+            )
+            executor._session_states["s1"] = state
+
+            with self.assertRaisesRegex(RuntimeError, "cleanup is incomplete"):
+                await executor._ensure_app_session(
+                    "s1",
+                    state,
+                    signature=(None, "new", "new", "new"),
+                    effective_cwd="/tmp",
+                )
+
+            existing.close.assert_awaited_once_with()
+            factory.assert_not_called()
+            self.assertIs(state.app_session, existing)
 
         _run(_t())
 
@@ -1108,6 +1348,28 @@ class TestCodexExecutor(unittest.TestCase):
             ]
             await executor.close_session("s1")
             self.assertTrue(fake_session.closed)
+
+        _run(_t())
+
+    def test_close_session_removes_cleaned_state_when_cancellation_is_reraised(self):
+        async def _t():
+            class _CancelledCleanSession:
+                cleaned = True
+
+                async def close(self) -> None:
+                    raise asyncio.CancelledError
+
+            executor = CodexExecutor(codex_path="/bin/echo")
+            app_session = _CancelledCleanSession()
+            executor._session_states["s1"] = _CodexSessionState(
+                app_session=app_session,  # type: ignore[arg-type]
+                signature=(None, "", "", ""),
+            )
+
+            with self.assertRaises(asyncio.CancelledError):
+                await executor.close_session("s1")
+
+            self.assertEqual(executor._session_states, {})
 
         _run(_t())
 
@@ -1239,7 +1501,9 @@ class TestCodexExecutor(unittest.TestCase):
                     codex_home = Path(recorded_env["CODEX_HOME"])
                     self.assertTrue(codex_home.is_dir())
                     self.assertTrue(codex_home.name.startswith("omnigent-codex-home-"))
-                    self.assertTrue(str(codex_home).startswith(tempfile.gettempdir()))
+                    self.assertTrue(
+                        codex_home.is_relative_to(Path(tempfile.gettempdir()).resolve())
+                    )
                     # Must not point at the user's real ~/.codex directory.
                     self.assertNotEqual(codex_home, Path.home() / ".codex")
                     await session.close()
@@ -2009,9 +2273,11 @@ class TestCodexExecutor(unittest.TestCase):
                 )
             ]
 
-            self.assertEqual(len(events), 1)
-            self.assertIsInstance(events[0], TurnComplete)
-            self.assertEqual(events[0].response, "done")
+            self.assertEqual(len(events), 2)
+            self.assertIsInstance(events[0], TextChunk)
+            self.assertEqual(events[0].text, "done")
+            self.assertIsInstance(events[1], TurnComplete)
+            self.assertEqual(events[1].response, "done")
 
         _run(_t())
 
@@ -3152,6 +3418,233 @@ def test_populate_codex_skills_from_bundle_links_bundle_skills(tmp_path: Path) -
     assert (linked / "SKILL.md").is_file()
 
 
+def test_populate_codex_skills_copy_mode_materializes_real_directories(
+    tmp_path: Path,
+) -> None:
+    """``copy_skills=True`` copies each skill instead of symlinking it.
+
+    Sandbox backends re-expose only the staged ``skills/`` subtree, so its
+    entries must be self-contained: a symlink whose target is the (unmounted)
+    bundle directory dangles inside the tool namespace, reproducing the
+    discoverable-but-unreadable failure the copy mode exists to prevent.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    bundle_skills = tmp_path / "bundle"
+    target = tmp_path / "codex_home_skills"
+    _make_skill_dir(bundle_skills, "alpha")
+
+    _populate_codex_skills(target, "all", [bundle_skills], copy_skills=True)
+
+    staged = target / "alpha"
+    assert staged.is_dir() and not staged.is_symlink(), (
+        "copy mode still symlinks; the mounted skills subtree would dangle "
+        "into the unmounted bundle directory inside the sandbox"
+    )
+    assert (staged / "SKILL.md").read_text() == (bundle_skills / "alpha" / "SKILL.md").read_text()
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="requires symlink support")
+def test_populate_codex_skills_copy_mode_keeps_skill_symlinks_as_links(
+    tmp_path: Path,
+) -> None:
+    """Copy mode must never dereference a symlink inside a skill directory.
+
+    The staged ``skills/`` subtree is re-exposed read-only inside sandboxes,
+    so following a link would materialize its out-of-bundle target — e.g. a
+    host credential file — into a mounted tree. Copied as a link, an escaping
+    target simply dangles inside the namespace and stays unreadable.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    secret = tmp_path / "host-secret.json"
+    secret.write_text('{"token": "never-copy-into-a-mounted-tree"}')
+    bundle_skills = tmp_path / "bundle"
+    skill_dir = _make_skill_dir(bundle_skills, "alpha")
+    (skill_dir / "creds").symlink_to(secret)
+
+    target = tmp_path / "codex_home_skills"
+    _populate_codex_skills(target, "all", [bundle_skills], copy_skills=True)
+
+    staged_link = target / "alpha" / "creds"
+    assert staged_link.is_symlink(), (
+        "copy mode dereferenced a skill symlink: the target's bytes were "
+        "materialized into the sandbox-mounted skills subtree"
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="requires symlink support")
+@pytest.mark.parametrize("linked_entry", ["skill_dir", "skills_root"])
+def test_populate_codex_skills_copy_mode_never_materializes_linked_skills(
+    tmp_path: Path, linked_entry: str
+) -> None:
+    """A linked skill directory or skills root stays a link in copy mode.
+
+    ``copytree`` follows a linked *source*, which would copy an external
+    directory's private files into the tree sandboxes are granted.
+    """
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    external = tmp_path / "external"
+    _make_skill_dir(external, "alpha")
+    canary = "external-canary-must-not-be-materialized"
+    (external / "alpha" / "private.txt").write_text(canary)
+    bundle_skills = tmp_path / "bundle" / "skills"
+    if linked_entry == "skill_dir":
+        bundle_skills.mkdir(parents=True)
+        (bundle_skills / "alpha").symlink_to(external / "alpha", target_is_directory=True)
+    else:
+        bundle_skills.parent.mkdir()
+        bundle_skills.symlink_to(external, target_is_directory=True)
+
+    target = tmp_path / "granted"
+    _populate_codex_skills(target, "all", [bundle_skills], copy_skills=True)
+
+    staged = target / "alpha"
+    assert staged.is_symlink()
+    assert (staged / "SKILL.md").resolve() == (external / "alpha" / "SKILL.md").resolve()
+    regular_files = [
+        Path(parent, name)
+        for parent, _, names in os.walk(target)
+        for name in names
+        if not Path(parent, name).is_symlink()
+    ]
+    assert [path for path in regular_files if canary in path.read_text()] == []
+
+
+@pytest.mark.parametrize("linked_entry", ["skill_dir", "skills_root"])
+@pytest.mark.parametrize("copy_skills", [False, True])
+def test_populate_codex_skills_uses_junction_fallback_for_linked_skills(
+    tmp_path: Path, linked_entry: str, copy_skills: bool
+) -> None:
+    """Linked skills use the directory-link fallback, never a materializing copy."""
+    from omnigent.inner import codex_staging
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    source = tmp_path / "source"
+    skill = _make_skill_dir(source, "alpha")
+    linked_path = skill if linked_entry == "skill_dir" else source
+    target = tmp_path / "granted"
+    junctions: list[tuple[str, str]] = []
+    with (
+        patch.object(Path, "is_junction", lambda path: path == linked_path),
+        patch.object(Path, "symlink_to", side_effect=OSError(1314, "privilege not held")),
+        patch.object(codex_staging, "sys", SimpleNamespace(platform="win32")),
+        patch.dict(
+            sys.modules,
+            {
+                "_winapi": SimpleNamespace(
+                    CreateJunction=lambda src, dst: junctions.append((src, dst))
+                )
+            },
+        ),
+        patch("omnigent.inner.codex_executor.shutil.copytree") as copy,
+    ):
+        _populate_codex_skills(target, "all", [source], copy_skills=copy_skills)
+
+    assert junctions == [(str(skill.resolve()), str(target / "alpha"))]
+    copy.assert_not_called()
+
+
+@pytest.mark.parametrize("copy_skills", [False, True])
+def test_populate_codex_skills_never_copies_linked_sources_when_links_fail(
+    tmp_path: Path, copy_skills: bool
+) -> None:
+    """Failure to preserve a directory link cannot authorize copying its target."""
+    from omnigent.inner import codex_staging
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    source = tmp_path / "source"
+    skill = _make_skill_dir(source, "alpha")
+    with (
+        patch.object(Path, "is_junction", lambda path: path == skill),
+        patch.object(Path, "symlink_to", side_effect=OSError("links unavailable")),
+        patch.object(codex_staging, "sys", SimpleNamespace(platform="linux")),
+        patch("omnigent.inner.codex_executor.shutil.copytree") as copy,
+    ):
+        _populate_codex_skills(tmp_path / "granted", "all", [source], copy_skills=copy_skills)
+
+    copy.assert_not_called()
+
+
+@pytest.mark.parametrize("relative_path", ["linked", "resources/linked", "resources/deep/linked"])
+def test_populate_codex_skills_copy_mode_skips_junctions_at_every_depth(
+    tmp_path: Path, relative_path: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A traversable directory marked as a junction is excluded before copying."""
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    source = tmp_path / "source"
+    skill = _make_skill_dir(source, "alpha")
+    junction = skill / relative_path
+    junction.mkdir(parents=True)
+    (junction / "private.txt").write_text("junction-target-canary")
+    target = tmp_path / "granted"
+    with patch.object(Path, "is_junction", lambda path: path == junction):
+        _populate_codex_skills(target, "all", [source], copy_skills=True)
+
+    assert (target / "alpha" / "SKILL.md").is_file()
+    assert not (target / "alpha" / relative_path).exists()
+    assert "junction" in caplog.text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows-only")
+@pytest.mark.parametrize("linked_entry", ["skill_dir", "skills_root"])
+def test_populate_codex_skills_preserves_linked_junctions_without_symlink_privilege(
+    tmp_path: Path, linked_entry: str
+) -> None:
+    """Real Windows junction-backed skills remain discoverable without symlink privilege."""
+    import _winapi
+
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    external = tmp_path / "external"
+    skill = _make_skill_dir(external, "alpha")
+    (skill / "private.txt").write_text("external-canary")
+    source = tmp_path / "source"
+    if linked_entry == "skill_dir":
+        source.mkdir()
+        _winapi.CreateJunction(str(skill), str(source / "alpha"))
+    else:
+        _winapi.CreateJunction(str(external), str(source))
+    target = tmp_path / "granted"
+    with patch.object(Path, "symlink_to", side_effect=OSError(1314, "privilege not held")):
+        _populate_codex_skills(target, "all", [source], copy_skills=True)
+
+    staged = target / "alpha"
+    assert staged.is_junction()
+    assert (staged / "SKILL.md").resolve() == (skill / "SKILL.md").resolve()
+    assert (staged / "private.txt").resolve() == (skill / "private.txt").resolve()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows-only")
+@pytest.mark.parametrize("relative_path", ["linked", "resources/deep/linked"])
+def test_populate_codex_skills_copy_mode_skips_nested_junctions(
+    tmp_path: Path, relative_path: str
+) -> None:
+    """Copying an ordinary skill never traverses a real nested Windows junction."""
+    import _winapi
+
+    from omnigent.inner.codex_executor import _populate_codex_skills
+
+    external = tmp_path / "external"
+    external.mkdir()
+    canary = external / "private.txt"
+    canary.write_text("outside-canary")
+    source = tmp_path / "source"
+    skill = _make_skill_dir(source, "alpha")
+    junction = skill / relative_path
+    junction.parent.mkdir(parents=True, exist_ok=True)
+    _winapi.CreateJunction(str(external), str(junction))
+    target = tmp_path / "granted"
+    with patch.object(Path, "symlink_to", side_effect=OSError(1314, "privilege not held")):
+        _populate_codex_skills(target, "all", [source], copy_skills=True)
+
+    assert (target / "alpha" / "SKILL.md").is_file()
+    assert not (target / "alpha" / relative_path).exists()
+    assert canary.read_text() == "outside-canary"
+
+
 def test_populate_codex_skills_from_bundle_sources_from_codex_home(tmp_path: Path) -> None:
     """
     ``source_codex_home`` reads host skills from the resolved ``$CODEX_HOME``.
@@ -3253,6 +3746,7 @@ async def test_embedded_codex_materializes_provider_auth_outside_argv(
             "-c",
             auth_command,
         ]
+        assert config["model_providers"]["omnigent_provider"]["auth"]["timeout_ms"] == 15000
         assert config["model_providers"]["omnigent_provider"]["wire_api"] == "responses"
         assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
         assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
@@ -3300,13 +3794,13 @@ def test_populate_codex_home_config_symlinks_auth_and_config(tmp_path: Path) -> 
     assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
 
 
-def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) -> None:
-    """``.credentials.json`` and its lock dir are symlinked, not left behind.
+def test_populate_codex_home_config_hard_links_remote_mcp_oauth(tmp_path: Path) -> None:
+    """``.credentials.json`` is hard-linked and its lock dir symlinked.
 
     Codex keeps OAuth tokens for remote (``url =``) MCP servers in
-    ``.credentials.json``, guarded across processes by
-    ``mcp-oauth-locks/``. A private home missing them starts those servers
-    unauthenticated while ``command =`` (stdio) servers still work.
+    ``.credentials.json``, guarded across processes by ``mcp-oauth-locks/``,
+    and rewrites it through an ``O_NOFOLLOW`` open that fails on a symlink
+    with ELOOP, so those servers never start.
     """
     from omnigent.inner.codex_executor import _populate_codex_home_config
 
@@ -3321,11 +3815,64 @@ def test_populate_codex_home_config_symlinks_remote_mcp_oauth(tmp_path: Path) ->
 
     _populate_codex_home_config(target, source)
 
-    # Symlinked (not copied) so a refresh in either direction is shared.
-    assert (target / ".credentials.json").is_symlink()
-    assert (target / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t"}}'
+    bridged = target / ".credentials.json"
+    assert not bridged.is_symlink()
+    assert bridged.samefile(source / ".credentials.json")
+    # Codex's in-place rewrite succeeds and the refresh reaches the real home.
+    fd = os.open(bridged, os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, b'{"linear|abc": {"access_token": "t2"}}')
+    finally:
+        os.close(fd)
+    assert (source / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t2"}}'
     assert (target / "mcp-oauth-locks").is_symlink()
     assert (target / "mcp-oauth-locks" / "file-store.lock").is_file()
+
+
+def test_populate_codex_home_config_copies_remote_mcp_oauth_across_filesystems(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Where the store cannot be hard-linked, it is bridged as a private copy."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    def _cross_device_link(*_args: object, **_kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "link", _cross_device_link)
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    (source / ".credentials.json").chmod(0o600)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source)
+
+    bridged = target / ".credentials.json"
+    assert not bridged.is_symlink()
+    assert not bridged.samefile(source / ".credentials.json")
+    assert bridged.read_text() == '{"linear|abc": {"access_token": "t"}}'
+    assert stat.S_IMODE(bridged.stat().st_mode) == 0o600
+    bridged.write_text('{"linear|abc": {"access_token": "t2"}}')
+    assert (source / ".credentials.json").read_text() == '{"linear|abc": {"access_token": "t"}}'
+
+
+def test_populate_codex_home_config_replaces_legacy_credentials_symlink(tmp_path: Path) -> None:
+    """A native session home reused from before hard-linking drops its symlink."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    (source / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    target = tmp_path / "reused_codex_home"
+    target.mkdir()
+    (target / ".credentials.json").symlink_to(source / ".credentials.json")
+
+    _populate_codex_home_config(target, source)
+
+    assert not (target / ".credentials.json").is_symlink()
+    assert (target / ".credentials.json").samefile(source / ".credentials.json")
 
 
 def test_populate_codex_home_config_symlinks_memories(tmp_path: Path) -> None:
@@ -3518,6 +4065,29 @@ def test_populate_codex_home_config_keeps_valid_effort(tmp_path: Path) -> None:
     assert (target / "config.toml").read_text() == original
 
 
+def test_populate_codex_home_config_preserves_native_effort(tmp_path: Path) -> None:
+    """Native Codex sessions preserve max and ultra reasoning effort."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    original = (
+        'model = "gpt-5.6-luna"\n'
+        'model_reasoning_effort = "max"\n'
+        "[profiles.other]\n"
+        'model_reasoning_effort = "ultra"\n'
+    )
+    (source / "config.toml").write_text(original)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source, supported_efforts=CODEX_NATIVE_EFFORTS)
+
+    copied = (target / "config.toml").read_text()
+    assert copied == original
+
+
 def test_populate_codex_home_config_normalizes_effort_after_multiline_array(
     tmp_path: Path,
 ) -> None:
@@ -3628,6 +4198,80 @@ def test_populate_codex_home_config_partial_files(tmp_path: Path) -> None:
 
     assert (target / "auth.json").is_symlink()
     assert not (target / "config.toml").exists()
+
+
+@pytest.mark.parametrize(
+    "user_agent,direct_tools",
+    [
+        ("omnigent/0.141.0 (macOS 15.6.1)", False),
+        ("omnigent/0.142.0", True),
+        ("codex_cli_rs/0.154.0", True),
+        ("custom-client/0.154.0-alpha.1 (client/0.1)", True),
+        ("unknown (client/0.154.0)", False),
+        (None, False),
+    ],
+)
+def test_app_server_negotiates_direct_tools_from_server_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    user_agent: str | None,
+    direct_tools: bool,
+) -> None:
+    """Only compatible servers receive the direct dynamic-tool setting."""
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+        lambda: tmp_path / "empty-config",
+    )
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.populate_codex_skills_from_bundle",
+        lambda *_args, **_kwargs: None,
+    )
+
+    async def _t() -> None:
+        session = _CodexAppServerSession(
+            codex_path="/fixture/codex", cwd=str(tmp_path), env={}, tool_executor=None
+        )
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"userAgent": user_agent}},
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+            ]
+        )
+        fake_process = _FakeProcess()
+        fake_process.stdout = _ScriptedStdoutPipe(
+            [
+                json.dumps(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turnId": "turn-1", "turn": {"id": "turn-1"}},
+                    }
+                ).encode()
+                + b"\n"
+            ]
+        )
+        with patch(
+            "omnigent.inner.codex_executor._create_subprocess_exec",
+            new=AsyncMock(return_value=fake_process),
+        ):
+            try:
+                async for _event in session.run_turn(
+                    messages=[{"role": "user", "content": "Read the screenshot"}],
+                    tools=[{"name": "snapshot", "description": "Screenshot", "parameters": {}}],
+                    system_prompt="",
+                    model="fixture-model",
+                    cwd=str(tmp_path),
+                    sandbox="workspace-write",
+                ):
+                    pass
+                config = session._request.await_args_list[1].args[1]["config"]
+                assert config["features.unified_exec"] is False
+                key = "features.code_mode.direct_only_tool_namespaces"
+                assert config.get(key) == (["functions"] if direct_tools else None)
+            finally:
+                await session.close()
+
+    _run(_t())
 
 
 def test_app_server_start_uses_real_home_for_private_inherited_codex_home(
@@ -3784,6 +4428,29 @@ def test_app_server_start_preserves_custom_home_from_inherited_private_symlink(
     _run(_t())
 
 
+def test_codex_home_source_preserves_custom_home_from_inherited_credentials_hardlink(
+    tmp_path: Path,
+) -> None:
+    """A nested launch resolves a custom home with no ``auth.json`` or memories symlink."""
+    from omnigent.inner.codex_executor import (
+        _populate_codex_home_config,
+        _resolve_codex_home_config_source,
+    )
+
+    custom_home = tmp_path / "custom-codex-home"
+    custom_home.mkdir()
+    (custom_home / "config.toml").write_text('model_provider = "custom"')
+    (custom_home / ".credentials.json").write_text('{"linear|abc": {"access_token": "t"}}')
+    inherited = tmp_path / "home" / ".omnigent" / "codex-native" / "abc123" / "codex-home"
+    inherited.mkdir(parents=True)
+
+    _populate_codex_home_config(inherited, custom_home)
+
+    assert not (inherited / ".credentials.json").is_symlink()
+    default_home = tmp_path / "home" / ".codex"
+    assert _resolve_codex_home_config_source(inherited, default_home) == custom_home.resolve()
+
+
 def test_populate_codex_home_config_does_not_overwrite_existing(tmp_path: Path) -> None:
     """If a config file already exists in the target (e.g. from a
     previous partial start), it is not replaced.
@@ -3867,6 +4534,489 @@ def test_materialize_codex_provider_config_applies_custom_retry_policy(tmp_path:
     assert provider["request_max_retries"] == 13
     assert provider["stream_max_retries"] == 13
     assert provider["stream_idle_timeout_ms"] == 300_000
+
+
+@pytest.mark.parametrize(
+    "private_url,source_defined,selected",
+    [
+        (None, True, True),
+        ("https://private.example.test/v1", True, True),
+        (None, False, True),
+        (None, True, False),
+    ],
+    ids=[
+        "missing-private-provider",
+        "private-provider-wins",
+        "missing-source-provider",
+        "unselected",
+    ],
+)
+def test_materialize_codex_provider_config_backfills_only_missing_selected_provider(
+    tmp_path: Path, private_url: str | None, source_defined: bool, selected: bool
+) -> None:
+    """Host definitions can fill a missing selection without replacing private choices."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    original = '[model_providers.unselected]\nname = "Unselected"\n'
+    if source_defined:
+        original += (
+            '[model_providers.gateway]\nname = "Gateway"\n'
+            'base_url = "https://source.example.test/v1"\nwire_api = "responses"\n'
+        )
+    (source / "config.toml").write_text(original)
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    private_config = (
+        'model = "private-model"\ndeveloper_instructions = "Keep these instructions"\n'
+    )
+    if private_url is not None:
+        private_config += (
+            f'[model_providers.gateway]\nname = "Private"\nbase_url = "{private_url}"\n'
+        )
+    config_path.write_text(private_config)
+    overrides = ['model_provider="gateway"'] if selected else []
+
+    assert materialize_codex_provider_config(private, overrides, source_home=source) == overrides
+
+    config = tomllib.loads(config_path.read_text())
+    assert config["model"] == "private-model"
+    assert config["developer_instructions"] == "Keep these instructions"
+    providers = config.get("model_providers", {})
+    assert "unselected" not in providers
+    if private_url is not None:
+        assert providers["gateway"]["base_url"] == private_url
+        assert providers["gateway"]["name"] == "Private"
+    elif selected and source_defined:
+        assert providers["gateway"]["base_url"] == "https://source.example.test/v1"
+    else:
+        assert "gateway" not in providers
+    assert (source / "config.toml").read_text() == original
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("private_style", ["inline", "standard"])
+def test_materialize_codex_provider_config_backfill_matches_private_table_style(
+    tmp_path: Path, private_style: str
+) -> None:
+    """A copied provider, nested tables included, serializes in the private file's table style."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        '[model_providers.gateway]\nname = "Gateway"\n'
+        'base_url = "https://source.example.test/v1"\nwire_api = "responses"\n'
+        '[model_providers.gateway.auth]\ncommand = "sh"\nargs = ["-c", "printf token"]\n'
+        '[model_providers.gateway.http_headers]\nX-Trace = "yes"\n'
+    )
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    if private_style == "inline":
+        config_path.write_text(
+            'model = "private-model"\n'
+            "model_providers = { other = "
+            '{ name = "Other", base_url = "https://other.example.test" } }\n'
+        )
+    else:
+        config_path.write_text(
+            'model = "private-model"\n'
+            '[model_providers.other]\nname = "Other"\nbase_url = "https://other.example.test"\n'
+        )
+    overrides = ['model_provider="gateway"']
+
+    assert materialize_codex_provider_config(private, overrides, source_home=source) == overrides
+
+    config = tomllib.loads(config_path.read_text())
+    assert config["model"] == "private-model"
+    providers = config["model_providers"]
+    assert providers["other"]["name"] == "Other"
+    assert providers["other"]["base_url"] == "https://other.example.test"
+    assert providers["gateway"]["base_url"] == "https://source.example.test/v1"
+    assert providers["gateway"]["auth"]["args"] == ["-c", "printf token"]
+    assert providers["gateway"]["http_headers"]["X-Trace"] == "yes"
+
+
+def test_materialize_codex_provider_config_generated_override_outranks_source_definition(
+    tmp_path: Path,
+) -> None:
+    """A generated table for the selected provider is kept over the host's definition."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        '[model_providers.gateway]\nname = "Host"\nbase_url = "https://source.example.test/v1"\n'
+    )
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "config.toml").write_text('model = "private-model"\n')
+    generated = (
+        'model_providers.gateway={name="Generated",'
+        'base_url="https://generated.example.test/v1",wire_api="responses"}'
+    )
+
+    assert materialize_codex_provider_config(
+        private, [generated, 'model_provider="gateway"'], source_home=source
+    ) == ['model_provider="gateway"']
+
+    provider = tomllib.loads((private / "config.toml").read_text())["model_providers"]["gateway"]
+    assert provider["name"] == "Generated"
+    assert provider["base_url"] == "https://generated.example.test/v1"
+
+
+@pytest.mark.parametrize(
+    "private_selection,overrides,expected",
+    [
+        (None, ["model_provider=gateway"], {"gateway"}),
+        (None, ['model_provider="gateway"', "model_provider=other"], {"other"}),
+        ("other", ["model_provider=gateway"], {"gateway"}),
+    ],
+    ids=["bare-value-selects", "last-override-wins", "override-replaces-private-selection"],
+)
+def test_materialize_codex_provider_config_reads_selection_like_codex(
+    tmp_path: Path, private_selection: str | None, overrides: list[str], expected: set[str]
+) -> None:
+    """A bare ``model_provider=name`` selects that provider and the last override wins."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        '[model_providers.gateway]\nname = "Gateway"\n[model_providers.other]\nname = "Other"\n'
+    )
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    private_config = 'model = "private-model"\n'
+    if private_selection is not None:
+        private_config += f'model_provider = "{private_selection}"\n'
+    config_path.write_text(private_config)
+
+    assert materialize_codex_provider_config(private, overrides, source_home=source) == overrides
+
+    config = tomllib.loads(config_path.read_text())
+    assert config["model"] == "private-model"
+    assert config.get("model_provider") == private_selection
+    assert set(config["model_providers"]) == expected
+
+
+def test_materialize_codex_provider_config_backfills_the_active_profile_selection(
+    tmp_path: Path,
+) -> None:
+    """Without an override, the private config's active profile decides the selection."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        '[model_providers.gateway]\nname = "Gateway"\n[model_providers.other]\nname = "Other"\n'
+    )
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    config_path.write_text(
+        'model = "private-model"\nprofile = "work"\nmodel_provider = "other"\n'
+        '[profiles.work]\nmodel_provider = "gateway"\n'
+    )
+
+    assert materialize_codex_provider_config(private, [], source_home=source) == []
+
+    config = tomllib.loads(config_path.read_text())
+    assert config["profile"] == "work"
+    assert config["model_provider"] == "other"
+    assert set(config["model_providers"]) == {"gateway"}
+
+
+@pytest.mark.parametrize("source_failure", ["toml", "utf8", "read", "stat"])
+def test_materialize_codex_provider_config_skips_unusable_optional_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    source_failure: str,
+) -> None:
+    """A host source failure cannot preempt providers supplied by other Codex layers."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+    from omnigent.spec.types import RetryPolicy
+
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    original_private = (
+        'model = "private-model"\n'
+        '[model_providers.existing]\nname = "Private"\nbase_url = "https://private.example.test"\n'
+    )
+    config_path.write_text(original_private)
+    source = tmp_path / "source"
+    source.mkdir()
+    source_path = source / "config.toml"
+    original_source = (
+        b"model_providers = ["
+        if source_failure == "toml"
+        else b"\xff"
+        if source_failure == "utf8"
+        else b""
+    )
+    source_path.write_bytes(original_source)
+    read_text = Path.read_text
+    is_file = Path.is_file
+
+    def read(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        if path == source_path and source_failure == "read":
+            raise PermissionError("source read unavailable")
+        return read_text(path, encoding=encoding, errors=errors)
+
+    def exists(path: Path) -> bool:
+        if path == source_path and source_failure == "stat":
+            raise OSError("source metadata unavailable")
+        return is_file(path)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(Path, "is_file", exists)
+    overrides = ['model_provider="managed_gateway"']
+
+    assert (
+        materialize_codex_provider_config(
+            private, overrides, source_home=source, retry_policy=RetryPolicy(max_retries=9)
+        )
+        == overrides
+    )
+    assert "skipping unusable Codex source config" in caplog.text
+    config = tomllib.loads(config_path.read_text())
+    assert config["model"] == "private-model"
+    assert set(config["model_providers"]) == {"existing"}
+    existing = config["model_providers"]["existing"]
+    assert existing["name"] == "Private"
+    assert existing["base_url"] == "https://private.example.test"
+    assert existing["request_max_retries"] == existing["stream_max_retries"] == 9
+    assert source_path.read_bytes() == original_source
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    "private_config", [b"model_providers = [", b"model_providers = 42\n", b"\xff"]
+)
+def test_materialize_codex_provider_config_preserves_invalid_private_config(
+    tmp_path: Path, private_config: bytes
+) -> None:
+    """A source definition cannot replace malformed private configuration."""
+    import tomlkit
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    private = tmp_path / "private"
+    private.mkdir()
+    config_path = private / "config.toml"
+    config_path.write_bytes(private_config)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text('[model_providers.gateway]\nname = "Gateway"\n')
+
+    with pytest.raises((ValueError, tomlkit.exceptions.TOMLKitError)):
+        materialize_codex_provider_config(
+            private, ['model_provider="gateway"'], source_home=source
+        )
+
+    assert config_path.read_bytes() == private_config
+
+
+def test_materialize_codex_provider_config_leaves_builtin_provider_tables_untouched(
+    tmp_path: Path,
+) -> None:
+    """Built-in provider tables get no retry stamping; custom tables in the same config do."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+    from omnigent.spec.types import RetryPolicy
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'model_provider = "amazon-bedrock"\n\n'
+        '[model_providers.amazon-bedrock.aws]\nregion = "us-east-1"\n\n'
+        '[model_providers.gateway]\nname = "Gateway"\nbase_url = "https://example.test"\n'
+    )
+
+    materialize_codex_provider_config(codex_home, [])
+
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    assert config["model_providers"]["amazon-bedrock"] == {"aws": {"region": "us-east-1"}}
+    gateway = config["model_providers"]["gateway"]
+    assert gateway["request_max_retries"] == RetryPolicy().max_retries
+
+
+@pytest.mark.parametrize("ci", [False, True])
+def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ci: bool,
+) -> None:
+    """Unity Gateway providers name Codex and Omnigent (plus ug for its own table)."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import (
+        _databricks_codex_config_overrides,
+        materialize_codex_provider_config,
+    )
+
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    if ci:
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"polly-review","run_id":"123"}')
+
+    gateway_url = "https://dbc-1.cloud.databricks.com/ai-gateway/codex/v1"
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        f'[model_providers.Databricks]\nbase_url = "{gateway_url}"\n\n'
+        "[model_providers.Databricks.http_headers]\n"
+        'User-Agent = "ucode/0.1.0 codex/0.145.0"\n\n'
+        '[model_providers.other]\nbase_url = "https://openrouter.ai/api/v1"\n'
+    )
+
+    materialize_codex_provider_config(
+        codex_home,
+        _databricks_codex_config_overrides(
+            model="system.ai.gpt-5-5", base_url=gateway_url, auth_command="printf token"
+        ),
+    )
+
+    providers = tomllib.loads((codex_home / "config.toml").read_text())["model_providers"]
+    tags = {}
+    if ci:
+        tags = {"Databricks-Ai-Gateway-Request-Tags": '{"pipeline":"polly-review","run_id":"123"}'}
+    assert providers["Databricks"]["http_headers"] == {
+        **tags,
+        "User-Agent": "ucode/0.1.0 codex/0.145.0",
+        "Databricks-Custom-Coding-Agent": "codex",
+        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
+    }
+    assert providers["omnigent_databricks"]["http_headers"] == {
+        **tags,
+        "Databricks-Custom-Coding-Agent": "codex",
+        "Databricks-Custom-Client-Surfaces": "omnigent",
+    }
+    assert "http_headers" not in providers["other"]
+
+
+@pytest.mark.parametrize("include_effective_providers", [True, False])
+@pytest.mark.parametrize("inline_providers", [False, True])
+def test_materialize_attributes_effective_gateway_without_copying_credentials(
+    tmp_path: Path,
+    include_effective_providers: bool,
+    inline_providers: bool,
+) -> None:
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    resolved_config = (
+        '[model_providers.Managed]\nname = "Managed Gateway"\n'
+        'base_url = "https://ws.cloud.databricks.com/ai-gateway/codex/v1"\n'
+        '[model_providers.Managed.auth]\ncommand = "secret-helper"\n'
+        "[model_providers.Managed.http_headers]\n"
+        'user-agent = "ucode/1 codex/1"\nAuthorization = "Bearer machine-secret"\n'
+        'Databricks-Custom-Client-Surfaces = "ug, inner"\n'
+    )
+    providers = tomllib.loads(resolved_config)["model_providers"]
+    private_home = tmp_path / "codex-home"
+    if inline_providers:
+        private_home.mkdir()
+        (private_home / "config.toml").write_text(
+            'model_providers = { other = { name = "Other", base_url = "https://example.test" } }\n'
+        )
+    materialize_codex_provider_config(
+        private_home, [], effective_providers=providers if include_effective_providers else None
+    )
+    config_path = private_home / "config.toml"
+    if include_effective_providers:
+        written = config_path.read_text()
+        provider = tomllib.loads(written)["model_providers"]["Managed"]
+        assert provider["name"] == "Managed Gateway"
+        assert provider["http_headers"] == {
+            "Databricks-Custom-Coding-Agent": "codex",
+            "Databricks-Custom-Client-Surfaces": "omnigent, ug, inner",
+        }
+        assert "base_url" not in provider
+        assert "auth" not in provider
+        assert "machine-secret" not in written
+    elif inline_providers:
+        assert "Managed" not in tomllib.loads(config_path.read_text())["model_providers"]
+    else:
+        assert not config_path.exists()
+    assert providers == tomllib.loads(resolved_config)["model_providers"]
+
+
+@pytest.mark.parametrize("existing_name", [None, "My Gateway", "", " \t", 7, False])
+def test_materialize_inherited_gateway_name_preserves_explicit_values(
+    tmp_path: Path, existing_name: str | int | bool | None
+) -> None:
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    private_home = tmp_path / "codex-home"
+    private_home.mkdir()
+    config_path = private_home / "config.toml"
+    config_path.write_text(
+        'model_provider = "Selected"\n'
+        '[model_providers.Selected]\nname = "Selected"\n'
+        'base_url = "https://other.example.test/v1"\n'
+        "[model_providers.Managed]\nrequest_max_retries = 2\n"
+        + (f"name = {json.dumps(existing_name)}\n" if existing_name is not None else "")
+    )
+    materialize_codex_provider_config(
+        private_home,
+        ['model_provider="Selected"'],
+        effective_providers={
+            "Managed": {
+                "name": "Managed Gateway",
+                "base_url": "https://ws.cloud.databricks.com/ai-gateway/codex/v1",
+            }
+        },
+    )
+    provider = tomllib.loads(config_path.read_text())["model_providers"]["Managed"]
+    expected_name = (
+        "Managed Gateway"
+        if existing_name is None or (isinstance(existing_name, str) and not existing_name.strip())
+        else existing_name
+    )
+    assert provider["name"] == expected_name
+    assert "base_url" not in provider
+
+
+def test_materialize_ignores_non_gateway_effective_providers(
+    tmp_path: Path,
+) -> None:
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    private_home = tmp_path / "codex-home"
+    assert (
+        materialize_codex_provider_config(
+            private_home,
+            [],
+            effective_providers={
+                "Other": {"base_url": "https://ws.cloud.databricks.com/serving-endpoints"}
+            },
+        )
+        == []
+    )
+    assert not (private_home / "config.toml").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -4205,6 +5355,95 @@ async def test_codex_cli_version_times_out_and_kills_proc(
     assert proc.killed is True
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"codex-cli (unknown build)\n",
+        b"codex-cli 0.139.0\n",
+        b"codex-cli 0.140.0-alpha.18\n",
+        b"codex-cli 0.140.0-alpha.19\n",
+        b"codex-cli 0.140.0\n",
+        b"codex-cli 0.141.0\n",
+        b"codex-cli 0.145.9\n",
+        b"codex-cli 0.146.1-alpha.1\n",
+        b"codex-cli 0.159.2-alpha.1\n",
+        b"codex-cli 0.159.2-dev.1\n",
+        b"codex-cli 0.146.0.post1\n",
+        b"dependency 0.146.0 codex-cli 0.146.0\n",
+    ],
+)
+async def test_brokered_codex_version_gate_rejects_old_and_unstable_versions_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    output: bytes,
+) -> None:
+    async def _fake_exec(*_args: Any, **_kwargs: Any) -> _FakeVersionProcess:
+        return _FakeVersionProcess(stdout=output)
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
+
+    with pytest.raises(RuntimeError, match="unsupported Codex wire version"):
+        await _require_brokered_codex_version("/usr/local/bin/codex")
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"codex-cli 0.146.0\n",
+        b"codex-cli 0.146.1\n",
+        b"codex-cli 0.154.0\n",
+        b"codex-cli 0.159.2\n",
+        b"codex-cli 1.0.0\n",
+    ],
+)
+async def test_brokered_codex_version_gate_accepts_stable_releases_from_0146(
+    monkeypatch: pytest.MonkeyPatch,
+    output: bytes,
+) -> None:
+    async def _fake_exec(*_args: Any, **_kwargs: Any) -> _FakeVersionProcess:
+        return _FakeVersionProcess(stdout=output)
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", _fake_exec)
+
+    await _require_brokered_codex_version("/usr/local/bin/codex")
+
+
+async def test_brokered_version_failure_precedes_signer_session_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    version_gate = AsyncMock(side_effect=RuntimeError("unsupported Codex wire version"))
+    app_session_factory = AsyncMock()
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._require_brokered_codex_version", version_gate
+    )
+    signer_config = SignerLaunchConfig(
+        binding_id="test-fake-provider-v1",
+        endpoint="https://model.test/v1",
+        routes=(FrozenModelRoute(method="POST", host="model.test", path="/v1/responses"),),
+    )
+    executor = CodexExecutor(
+        cwd=str(tmp_path),
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+        model="gpt-5.4-mini",
+        codex_path="/usr/local/bin/codex",
+        app_session_factory=app_session_factory,
+        signer_launch_config=signer_config,
+    )
+
+    with pytest.raises(RuntimeError, match="unsupported Codex wire version"):
+        await anext(
+            executor.run_turn(
+                [{"role": "user", "content": "hello", "session_id": "version-gate"}],
+                [],
+                "",
+            )
+        )
+
+    version_gate.assert_awaited_once_with("/usr/local/bin/codex")
+    app_session_factory.assert_not_called()
+    assert executor._session_states == {}
+
+
 # ── model_provider_override (cli-config / subscription pinning) ─────────────
 # Function-based (the project standard); the TestCase class above predates it.
 
@@ -4273,17 +5512,93 @@ def test_select_codex_skill_dirs_none_and_list(tmp_path: Path) -> None:
 
 
 def test_codex_skill_sources_order_bundle_then_host(tmp_path: Path) -> None:
-    """codex_skill_sources lists <bundle>/skills before <home>/.codex/skills."""
-    from omnigent.inner.codex_executor import codex_skill_sources
+    """Bundle and Codex-specific skills take precedence over shared skills."""
+    from omnigent.inner.codex_executor import CodexSkillSources, codex_skill_sources
 
     bundle = tmp_path / "bundle"
     (bundle / "skills").mkdir(parents=True)
     home = tmp_path / "home"
     (home / ".codex" / "skills").mkdir(parents=True)
-    assert codex_skill_sources(bundle, home) == [
+    (home / ".agents" / "skills").mkdir(parents=True)
+    assert codex_skill_sources(bundle, home) == CodexSkillSources(
+        linked=[bundle / "skills", home / ".codex" / "skills", home / ".agents" / "skills"],
+        native=[],
+    )
+
+
+def test_codex_skill_sources_workspace_repo_scope_order(tmp_path: Path) -> None:
+    """Workspace ``.agents`` skills up to the git root are native, nearest first, never linked."""
+    from omnigent.inner.codex_executor import CodexSkillSources, codex_skill_sources
+
+    bundle = tmp_path / "bundle"
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    workspace = repo / "pkg" / "app"
+    for directory in (
         bundle / "skills",
         home / ".codex" / "skills",
-    ]
+        home / ".agents" / "skills",
+        tmp_path / ".agents" / "skills",
+        repo / ".agents" / "skills",
+        workspace / ".agents" / "skills",
+    ):
+        directory.mkdir(parents=True)
+    # A worktree's .git file marks the repository root like a .git directory.
+    (repo / ".git").write_text("gitdir: elsewhere\n")
+    assert codex_skill_sources(bundle, home, workspace=workspace) == CodexSkillSources(
+        linked=[bundle / "skills", home / ".codex" / "skills", home / ".agents" / "skills"],
+        native=[
+            workspace.resolve() / ".agents" / "skills",
+            repo.resolve() / ".agents" / "skills",
+        ],
+    )
+
+
+def test_codex_skill_sources_workspace_outside_repo(tmp_path: Path) -> None:
+    """Outside a repo only the workspace's own dir counts; ``$HOME`` keeps its user rank."""
+    from omnigent.inner.codex_executor import CodexSkillSources, codex_skill_sources
+
+    if any((parent / ".git").exists() for parent in Path(os.path.realpath(tmp_path)).parents):
+        pytest.skip("tmp_path is inside a git checkout; outside-repo scoping can't be exercised")
+
+    home = tmp_path / "home"
+    workspace = tmp_path / "ws"
+    for directory in (
+        home / ".codex" / "skills",
+        home / ".agents" / "skills",
+        tmp_path / ".agents" / "skills",
+        workspace / ".agents" / "skills",
+    ):
+        directory.mkdir(parents=True)
+    host_tiers = [home / ".codex" / "skills", home / ".agents" / "skills"]
+    assert codex_skill_sources(None, home, workspace=workspace) == CodexSkillSources(
+        linked=host_tiers, native=[workspace.resolve() / ".agents" / "skills"]
+    )
+    assert codex_skill_sources(None, home, workspace=home) == CodexSkillSources(
+        linked=host_tiers, native=[]
+    )
+
+
+def test_codex_skill_sources_skips_symlink_loops(tmp_path: Path) -> None:
+    """A looping skills symlink is skipped without hiding the valid workspace or host tiers."""
+    from omnigent.inner.codex_executor import CodexSkillSources, codex_skill_sources
+
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    workspace = repo / "app"
+    for directory in (
+        home / ".codex" / "skills",
+        home / ".agents",
+        repo / ".git",
+        repo / ".agents",
+        workspace / ".agents" / "skills",
+    ):
+        directory.mkdir(parents=True)
+    for looping in (home / ".agents" / "skills", repo / ".agents" / "skills"):
+        looping.symlink_to(looping)
+    assert codex_skill_sources(None, home, workspace=workspace) == CodexSkillSources(
+        linked=[home / ".codex" / "skills"], native=[workspace.resolve() / ".agents" / "skills"]
+    )
 
 
 def test_codex_skill_sources_omits_absent_dirs(tmp_path: Path) -> None:
@@ -4292,8 +5607,8 @@ def test_codex_skill_sources_omits_absent_dirs(tmp_path: Path) -> None:
 
     home = tmp_path / "home"
     (home / ".codex" / "skills").mkdir(parents=True)
-    assert codex_skill_sources(None, home) == [home / ".codex" / "skills"]
-    assert codex_skill_sources(tmp_path / "no-bundle", home) == [home / ".codex" / "skills"]
+    assert codex_skill_sources(None, home).linked == [home / ".codex" / "skills"]
+    assert codex_skill_sources(tmp_path / "no-bundle", home).linked == [home / ".codex" / "skills"]
 
 
 def test_clean_codex_env_honors_extra_allow(monkeypatch):
@@ -4354,8 +5669,14 @@ def test_find_codex_cli_delegates_to_shared_resolver(monkeypatch):
     assert captured == {"name": "codex", "env_var": "OMNIGENT_CODEX_PATH"}
 
 
-class TestCodexAppServerSessionReadOnlyCwd(unittest.TestCase):
-    """Regression tests for .codex-tmp fallback on read-only cwd."""
+class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
+    """The per-conversation CODEX_HOME must be staged outside the workspace.
+
+    Staging under the session cwd left an untracked dir dirtying the
+    user's clone and put the published skill paths under the sandbox's
+    hidden-dotdir mask, so homes now live under the well-known temp-dir
+    staging root regardless of cwd.
+    """
 
     def _run_start_and_capture_mkdtemp_dir(self, cwd: str) -> str:
         """Run ``_CodexAppServerSession.start()`` with *cwd* and return
@@ -4372,9 +5693,9 @@ class TestCodexAppServerSessionReadOnlyCwd(unittest.TestCase):
         mkdtemp_dirs: list[str] = []
         original_mkdtemp = _tempfile.mkdtemp
 
-        def _capture(**kwargs):
+        def _capture(*args, **kwargs):
             mkdtemp_dirs.append(kwargs.get("dir", ""))
-            return original_mkdtemp(**kwargs)
+            return original_mkdtemp(*args, **kwargs)
 
         async def _t():
             session = _CodexAppServerSession(
@@ -4405,24 +5726,130 @@ class TestCodexAppServerSessionReadOnlyCwd(unittest.TestCase):
 
         return _run(_t())
 
-    def test_start_falls_back_to_tempdir_when_cwd_is_readonly(self):
-        """When cwd is ``/`` (read-only on macOS SSV), the codex home
-        must be placed under the system temp directory, not under
-        ``/.codex-tmp``.
+    def test_start_stages_home_under_the_staging_root_not_cwd(self):
+        """A writable cwd must NOT host the codex home: staging inside the
+        workspace dirties the user's clone and hides the published skill
+        paths behind the sandbox's hidden-dotdir mask.
         """
         import tempfile as _tempfile
 
-        dir_used = self._run_start_and_capture_mkdtemp_dir("/")
-        self.assertEqual(dir_used, _tempfile.gettempdir())
-
-    def test_start_uses_cwd_when_writable(self):
-        """When cwd is writable, .codex-tmp is placed there as before."""
-        import tempfile as _tempfile
+        from omnigent.inner.codex_staging import codex_home_staging_root
 
         with _tempfile.TemporaryDirectory() as writable_dir:
             dir_used = self._run_start_and_capture_mkdtemp_dir(writable_dir)
-            expected = str(Path(writable_dir) / ".codex-tmp")
-            self.assertEqual(dir_used, expected)
+            self.assertEqual(dir_used, str(codex_home_staging_root()))
+            self.assertFalse(dir_used.startswith(writable_dir))
+
+    def test_start_falls_back_to_tempdir_when_staging_root_uncreatable(self):
+        """An uncreatable staging root must not break session start — the
+        home falls back to the plain system temp directory.
+        """
+        import tempfile as _tempfile
+
+        with (
+            _tempfile.TemporaryDirectory() as writable_dir,
+            patch(
+                "omnigent.inner.codex_executor.codex_home_staging_root",
+                side_effect=OSError("unwritable temp dir"),
+            ),
+        ):
+            dir_used = self._run_start_and_capture_mkdtemp_dir(writable_dir)
+            self.assertEqual(dir_used, _tempfile.gettempdir())
+
+    def _start_until_worker_spawn(
+        self, check_codex_home: Callable[[Path], None], **session_kwargs: Any
+    ) -> None:
+        """Run ``start()`` up to the worker spawn, handing its CODEX_HOME to *check_codex_home*."""
+
+        async def _stop_before_spawn(*args: Any, **kwargs: Any) -> None:
+            check_codex_home(Path(kwargs["env"]["CODEX_HOME"]))
+            raise RuntimeError("stop before worker spawn")
+
+        async def _t() -> None:
+            with tempfile.TemporaryDirectory() as workspace:
+                session = _CodexAppServerSession(
+                    codex_path="/bin/echo",
+                    cwd=workspace,
+                    env={},
+                    tool_executor=None,
+                    **session_kwargs,
+                )
+                with (
+                    patch("omnigent.inner.codex_executor._populate_codex_home_config"),
+                    patch(
+                        "omnigent.inner.codex_executor._codex_home_config_source_from_env",
+                        return_value=None,
+                    ),
+                    patch(
+                        "omnigent.inner.codex_executor._create_subprocess_exec",
+                        new_callable=AsyncMock,
+                        side_effect=_stop_before_spawn,
+                    ) as spawn,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "stop before worker spawn"):
+                        await session.start()
+                    spawn.assert_awaited_once()
+
+        _run(_t())
+
+    def test_start_stages_empty_skills_before_worker_spawn_when_disabled(self):
+        """Disabled skills still have a real directory to mount read-only."""
+
+        def _check(codex_home: Path) -> None:
+            skills = codex_home / "skills"
+            self.assertTrue(skills.is_dir())
+            self.assertTrue(skills.is_symlink())
+            self.assertTrue(skills.resolve().name.startswith("omnigent-codex-skills-"))
+            self.assertEqual(list(skills.iterdir()), [])
+
+        self._start_until_worker_spawn(_check, skills_filter="none")
+
+    @unittest.skipUnless(hasattr(os, "getuid"), "a POSIX symlink stands in for the junction")
+    def test_start_links_skills_through_a_junction_when_symlinks_are_refused(self):
+        """Windows without Developer Mode refuses symlinks. Startup must still
+        succeed, with the published skill path inside the session's grant.
+        """
+        from omnigent.inner import codex_staging
+
+        def _junction(target: str, link: str) -> None:
+            os.symlink(target, link, target_is_directory=True)
+
+        def _check(codex_home: Path) -> None:
+            manifest = (codex_home / "skills" / "alpha" / "SKILL.md").resolve()
+            self.assertTrue(manifest.is_file())
+            self.assertTrue(manifest.parents[1].name.startswith("omnigent-codex-skills-"))
+
+        with tempfile.TemporaryDirectory() as root:
+            bundle = Path(root) / "bundle"
+            _mk_codex_skill(bundle / "skills", "alpha")
+            with (
+                patch.object(Path, "symlink_to", side_effect=OSError(1314, "privilege not held")),
+                patch.object(codex_staging, "sys", SimpleNamespace(platform="win32")),
+                patch.dict(sys.modules, {"_winapi": SimpleNamespace(CreateJunction=_junction)}),
+            ):
+                self._start_until_worker_spawn(_check, bundle_dir=bundle, skills_filter=["alpha"])
+
+    def test_start_copies_skills_into_the_home_when_no_link_is_possible(self):
+        """Without any directory link, Codex must still start and discover the
+        bundle's skills, and the degraded sandbox visibility must be reported.
+        """
+        from omnigent.inner import codex_staging
+
+        def _check(codex_home: Path) -> None:
+            skills = codex_home / "skills"
+            self.assertFalse(skills.is_symlink())
+            self.assertTrue((skills / "alpha" / "SKILL.md").is_file())
+
+        with tempfile.TemporaryDirectory() as root:
+            bundle = Path(root) / "bundle"
+            _mk_codex_skill(bundle / "skills", "alpha")
+            with (
+                patch.object(Path, "symlink_to", side_effect=OSError(1314, "privilege not held")),
+                patch.object(codex_staging, "sys", SimpleNamespace(platform="linux")),
+                self.assertLogs("omnigent.inner.codex_executor", level="WARNING") as logs,
+            ):
+                self._start_until_worker_spawn(_check, bundle_dir=bundle, skills_filter=["alpha"])
+        self.assertTrue(any("restricted reads" in line for line in logs.output), logs.output)
 
 
 def test_run_turn_cli_config_passes_no_model_to_thread_create():
@@ -4449,12 +5876,93 @@ def test_run_turn_cli_config_passes_no_model_to_thread_create():
     _run(_t())
 
 
-def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
-    """With no model anywhere, a codex-login turn gets a model codex accepts.
+def test_default_factory_wires_fresh_typed_signer_per_session(tmp_path: Path) -> None:
+    async def _t() -> None:
+        config = SignerLaunchConfig(
+            binding_id="test-fake-provider-v1",
+            endpoint="https://model.test/v1",
+            routes=(FrozenModelRoute(method="POST", host="model.test", path="/v1/responses"),),
+        )
+        executor = CodexExecutor(
+            cwd=str(tmp_path),
+            os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+            codex_path="/bin/echo",
+            model="gpt-5.4-mini",
+            signer_launch_config=config,
+        )
 
-    The bundled OpenAI catalog's newest row is the bare family alias
-    ``gpt-5.6``, which a ChatGPT-account backend rejects with a 400, so this
-    path must default from codex's own catalog instead.
+        first_state = _CodexSessionState()
+        second_state = _CodexSessionState()
+        executor._session_states["first"] = first_state
+        executor._session_states["second"] = second_state
+        first = await executor._ensure_app_session(
+            "first",
+            first_state,
+            signature=(None, "model", str(tmp_path), "workspace-write"),
+            effective_cwd=str(tmp_path),
+        )
+        second = await executor._ensure_app_session(
+            "second",
+            second_state,
+            signature=(None, "model", str(tmp_path), "workspace-write"),
+            effective_cwd=str(tmp_path),
+        )
+
+        first_signer = first._signer_factory()
+        second_signer = second._signer_factory()
+        assert isinstance(first_signer, SubprocessModelSigner)
+        assert isinstance(second_signer, SubprocessModelSigner)
+        assert first_signer is not second_signer
+        assert first_signer._config is config
+        rendered = "\n".join(executor._codex_config_overrides)
+        assert 'env_key="OPENAI_API_KEY"' in rendered
+        assert "auth=" not in rendered
+        assert "gateway_auth_command" not in rendered
+
+    _run(_t())
+
+
+def test_signer_backed_executor_rejects_missing_sandbox_before_session() -> None:
+    config = SignerLaunchConfig(
+        binding_id="test-fake-provider-v1",
+        endpoint="https://model.test/v1",
+        routes=(FrozenModelRoute(method="POST", host="model.test", path="/v1/responses"),),
+    )
+
+    with pytest.raises(OSError, match="requires an active sandbox"):
+        CodexExecutor(
+            codex_path="/bin/echo",
+            model="gpt-5.4-mini",
+            signer_launch_config=config,
+        )
+
+
+def test_signer_backed_executor_rejects_ordinary_egress_rules_before_session() -> None:
+    config = SignerLaunchConfig(
+        binding_id="test-fake-provider-v1",
+        endpoint="https://model.test/v1",
+        routes=(FrozenModelRoute(method="POST", host="model.test", path="/v1/responses"),),
+    )
+
+    with pytest.raises(ValueError, match=r"does not support os_env\.sandbox\.egress_rules"):
+        CodexExecutor(
+            codex_path="/bin/echo",
+            model="gpt-5.4-mini",
+            os_env=OSEnvSpec(
+                sandbox=OSEnvSandboxSpec(
+                    type="darwin_seatbelt",
+                    egress_rules=["GET api.github.com/repos/company/**"],
+                )
+            ),
+            signer_launch_config=config,
+        )
+
+
+def test_run_turn_leaves_the_default_to_codex_on_codexs_own_login():
+    """With no model anywhere, a codex-login turn starts on codex's own default.
+
+    Omnigent names no model, so codex resolves its configured or catalog
+    default instead of a release-pinned arm that can lag codex's catalog.
     """
 
     async def _t():
@@ -4470,8 +5978,7 @@ def test_run_turn_defaults_to_a_codex_model_on_codexs_own_login():
         ):
             pass
         model = fake_session.calls[0]["model"]
-        assert model == CODEX_DEFAULT_MODEL
-        assert codex_spawn_model(model) == model, "not codex's own spelling"
+        assert model is None
 
     _run(_t())
 
@@ -4614,6 +6121,59 @@ def test_app_server_run_turn_fails_fast_on_gateway_auth_error():
     _run(_t())
 
 
+def test_signer_runtime_auth_failure_preserves_recovery_error():
+    async def _t():
+        native_forwarder_health.clear()
+        session = _CodexAppServerSession(
+            codex_path="/bin/echo",
+            cwd="/tmp/workspace",
+            env={},
+            tool_executor=None,
+            provider_auth_authority=(
+                "https://workspace.cloud.databricks.com",
+                "agent-profile",
+            ),
+        )
+        session.start = AsyncMock()
+        session._proc = _FakeProcess()
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+                {"result": {}},
+            ]
+        )
+
+        async def _inject_gateway_error() -> None:
+            await asyncio.sleep(0.01)
+            session._note_stderr_gateway_error("Reconnecting... 5/5")
+            session._note_stderr_gateway_error(
+                "unexpected status 401 Unauthorized: {}, "
+                "url: https://workspace.cloud.databricks.com/"
+                "ai-gateway/codex/v1/responses"
+            )
+
+        inject_task = asyncio.create_task(_inject_gateway_error())
+        try:
+            with pytest.raises(ProviderAuthRequired) as raised:
+                async for _ in session.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    system_prompt="Be helpful.",
+                    model="databricks-gpt-5",
+                    cwd=".",
+                    sandbox="workspace-write",
+                ):
+                    pass
+            assert raised.value.code == "PROVIDER_AUTH_REQUIRED"
+            assert raised.value.remediation == "ucode configure"
+        finally:
+            await inject_task
+            native_forwarder_health.clear()
+
+    _run(_t())
+
+
 def test_run_turn_clears_stale_gateway_error_at_turn_start():
     """A new turn forgets a prior turn's fatal signal so it can't misfire."""
 
@@ -4659,3 +6219,487 @@ def test_run_turn_clears_stale_gateway_error_at_turn_start():
         assert not any(isinstance(e, ExecutorError) for e in events), events
 
     _run(_t())
+
+
+# A launcher certificate error plus a connection retry must fail the turn promptly.
+
+_CERTIFICATE_STDERR_LINE = (
+    "Failed to fetch safe flags from proxy: [SSL: SSLV3_ALERT_CERTIFICATE_EXPIRED] "
+    "ssl/tls alert certificate expired (_ssl.c:2580)"
+)
+
+
+def _connection_retry_event(*, http_status: int | None = None) -> dict:
+    """The ``error``/``willRetry`` notification codex-cli 0.154 emits per reconnect."""
+    return {
+        "method": "error",
+        "params": {
+            "error": {
+                "message": "Reconnecting... waiting for network",
+                "codexErrorInfo": {"responseStreamDisconnected": {"httpStatusCode": http_status}},
+                "additionalDetails": "Connection failed: error sending request",
+            },
+            "willRetry": True,
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+        },
+    }
+
+
+def _completed_turn_event() -> dict:
+    return {
+        "method": "turn/completed",
+        "params": {"turn": {"id": "turn-1", "status": "completed"}},
+    }
+
+
+def _session_with_scripted_turn() -> _CodexAppServerSession:
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session._request = AsyncMock(
+        side_effect=[
+            {"result": {"thread": {"id": "thread-1"}}},
+            {"result": {"turn": {"id": "turn-1"}}},
+            {"result": {}},
+        ]
+    )
+    return session
+
+
+async def _run_turn_with_events(session: _CodexAppServerSession, events: list[dict]) -> list:
+    async def _inject() -> None:
+        for event in events:
+            await asyncio.sleep(0.01)
+            session._events.put_nowait(event)
+
+    inject_task = asyncio.create_task(_inject())
+    # Bounded so a head that keeps waiting on Codex's reconnect loop fails
+    # here instead of hanging the suite.
+    async with asyncio.timeout(10):
+        collected = [
+            event
+            async for event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="Be helpful.",
+                model="gpt-5",
+                cwd=".",
+                sandbox="workspace-write",
+            )
+        ]
+    await inject_task
+    return collected
+
+
+def test_certificate_failure_on_stderr_fails_fast_on_connection_retry():
+    """The launcher's certificate line plus Codex's first reconnect ends the turn."""
+
+    async def _t():
+        native_forwarder_health.clear()
+        try:
+            session = _session_with_scripted_turn()
+            session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+            events = await _run_turn_with_events(session, [_connection_retry_event()])
+
+            errors = [event for event in events if isinstance(event, ExecutorError)]
+            assert len(errors) == 1, events
+            error = errors[0]
+            assert error.retryable is False
+            assert "could not connect to its model endpoint for gpt-5" in error.message
+            assert "the TLS certificate has expired" in error.message
+            assert "SSLV3_ALERT_CERTIFICATE_EXPIRED" in error.message
+            assert "wedged LLM" not in error.message
+            assert error.code == "model_endpoint_certificate_rejected"
+            assert error.title == "Codex can't reach its model endpoint"
+            assert error.remediation is not None and "run dbcert" in error.remediation
+            session._request.assert_any_await(
+                "turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"}
+            )
+        finally:
+            native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def test_connection_retry_without_certificate_evidence_keeps_waiting():
+    """Codex reconnecting on its own stays a retry; only the idle-watchdog cause is recorded."""
+
+    async def _t():
+        native_forwarder_health.clear()
+        try:
+            session = _session_with_scripted_turn()
+
+            events = await _run_turn_with_events(
+                session, [_connection_retry_event(), _completed_turn_event()]
+            )
+
+            assert not any(isinstance(event, ExecutorError) for event in events), events
+            detail = native_forwarder_health.recent_post_failure(60.0)
+            assert detail is not None
+            assert "reconnecting to its model endpoint" in detail
+            assert "Connection failed: error sending request" in detail
+        finally:
+            native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def test_retry_with_http_status_is_not_blamed_on_certificate():
+    """A retry that got an HTTP response reached the endpoint over TLS, so the turn continues."""
+
+    async def _t():
+        native_forwarder_health.clear()
+        try:
+            session = _session_with_scripted_turn()
+            session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+            events = await _run_turn_with_events(
+                session, [_connection_retry_event(http_status=503), _completed_turn_event()]
+            )
+
+            assert not any(isinstance(event, ExecutorError) for event in events), events
+        finally:
+            native_forwarder_health.clear()
+
+    _run(_t())
+
+
+def _failed_turn_event(message: str) -> dict:
+    return {"method": "turn/failed", "params": {"turn": {"id": "turn-1"}, "message": message}}
+
+
+def test_turn_failed_on_connection_names_certificate_cause():
+    """A connection-level turn failure after the certificate line names the certificate."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+        events = await _run_turn_with_events(
+            session, [_failed_turn_event("stream disconnected: error sending request")]
+        )
+
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].retryable is False
+        assert "the TLS certificate has expired" in errors[0].message
+        assert "SSLV3_ALERT_CERTIFICATE_EXPIRED" in errors[0].message
+        assert "Codex reported: stream disconnected: error sending request" in errors[0].message
+
+    _run(_t())
+
+
+def test_turn_failed_after_connection_retry_names_certificate_cause():
+    """A retry that got no response, then a bare failure, is still the certificate's doing."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+        session._request = AsyncMock(
+            side_effect=[
+                {"result": {"thread": {"id": "thread-1"}}},
+                {"result": {"turn": {"id": "turn-1"}}},
+            ]
+        )
+        # Interrupting is best-effort; a failed interrupt must not mask the cause.
+        session._interrupt_failed_turn = AsyncMock()
+
+        events = await _run_turn_with_events(
+            session, [_connection_retry_event(), _failed_turn_event("turn failed")]
+        )
+
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].retryable is False
+        assert "the TLS certificate has expired" in errors[0].message
+
+    _run(_t())
+
+
+def test_turn_failed_for_unrelated_reason_keeps_its_own_error():
+    """A tool or provider failure keeps Codex's text and stays retryable despite the line."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+
+        events = await _run_turn_with_events(
+            session, [_failed_turn_event("command exited with code 1")]
+        )
+
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].retryable is True
+        assert errors[0].message == "command exited with code 1"
+
+    _run(_t())
+
+
+@pytest.mark.parametrize(
+    "turn",
+    [{"id": "turn-1", "status": "completed"}, {"id": "turn-1"}],
+    ids=["status-completed", "legacy-no-status"],
+)
+def test_completed_turn_clears_certificate_evidence(turn: dict):
+    """A turn that reaches the model proves the egress works; the launch-time line is forgotten."""
+
+    async def _t():
+        session = _session_with_scripted_turn()
+        session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+        assert session._certificate_failure is not None
+
+        events = await _run_turn_with_events(
+            session, [{"method": "turn/completed", "params": {"turn": turn}}]
+        )
+
+        assert not any(isinstance(event, ExecutorError) for event in events), events
+        assert session._certificate_failure is None
+
+    _run(_t())
+
+
+@pytest.fixture
+def disabled_mcp_session(tmp_path, monkeypatch):
+    from omnigent import mcp_disabled_servers as disabled
+    from tests._helpers.mcp_disabled_servers import launch_activation
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    disabled.set_disabled(disabled.ServerKey("codex", "fixture"), True)
+    (source_home / "config.toml").write_text('[mcp_servers.fixture]\ncommand="true"\n')
+    plans = []
+    real_plan = disabled.plan_codex_launch
+
+    def plan(*args, **kwargs):
+        result = real_plan(*args, **kwargs)
+        plans.append(result)
+        return result
+
+    hook = Mock(side_effect=plan)
+    monkeypatch.setattr(disabled, "plan_codex_launch", hook)
+
+    async def prepare(_home, overrides, **_kwargs):
+        return list(overrides)
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.prepare_codex_provider_config", prepare
+    )
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd=str(tmp_path),
+        env={},
+        tool_executor=None,
+        codex_config_overrides=["base=true"],
+        active_harnesses=launch_activation(["codex"]),
+    )
+    spawns = []
+    processes = []
+
+    async def spawn(*args, **kwargs):
+        spawns.append(args)
+        process = _FakeProcess()
+        process.stdout = _ScriptedStdoutPipe([])
+        processes.append(process)
+        return process
+
+    initialize = AsyncMock(return_value={"result": {}})
+    monkeypatch.setattr(session, "_request", initialize)
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    return SimpleNamespace(
+        session=session,
+        spawns=spawns,
+        processes=processes,
+        initialize=initialize,
+        source_home=source_home,
+        hook=hook,
+        plans=plans,
+    )
+
+
+@pytest.fixture
+def signed_disabled_mcp_session(disabled_mcp_session, monkeypatch):
+    from omnigent.inner.codex_worker import CodexWorkerLaunch
+    from tests.inner.test_model_signer_lifecycle import _Signer
+
+    harness = disabled_mcp_session
+    monkeypatch.setattr("omnigent.inner.codex_executor._populate_codex_home_config", Mock())
+    signer = _Signer([])
+    harness.signer = signer
+    harness.session._signer_factory = lambda: signer
+    harness.session._os_env_spec = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt"))
+    # Signer homes omit ambient MCPs; this server belongs to the caller's CLI layer.
+    harness.baseline = ("base=true", 'mcp_servers.fixture.command="true"')
+    harness.session._base_codex_config_overrides = harness.baseline
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.prepare_codex_worker",
+        lambda **kwargs: CodexWorkerLaunch("/bin/echo", sandboxed=True),
+    )
+    return harness
+
+
+@pytest.mark.parametrize(
+    "error",
+    [BrokenPipeError(), ConnectionResetError(), None],
+    ids=["broken-pipe", "connection-reset", "stdout-eof"],
+)
+async def test_disabled_mcp_applied_early_exit_relaunches_baseline(
+    signed_disabled_mcp_session, caplog, error
+):
+    from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
+
+    harness = signed_disabled_mcp_session
+    session = harness.session
+
+    async def initialize(method, params):
+        if len(harness.spawns) == 1:
+            session._recent_stderr.append(_CERTIFICATE_STDERR_LINE)
+            session._note_stderr_gateway_error(_CERTIFICATE_STDERR_LINE)
+            session._saw_connection_retry = True
+            process = harness.processes[-1]
+            if error is not None:
+                process.returncode = 1
+                raise error
+
+            async def wait_for_exit():
+                # stdout EOF precedes asyncio's child-exit notification.
+                await asyncio.sleep(0)
+                process.returncode = 1
+                return 1
+
+            process.wait = wait_for_exit
+            process.stdout = _FakePipe()
+            return await _CodexAppServerSession._request(session, method, params)
+        assert not harness.signer.closed
+        assert session._signer is harness.signer
+        assert session._certificate_failure is None
+        assert session._recent_stderr == []
+        assert not session._saw_connection_retry
+        return {"result": {}}
+
+    harness.initialize.side_effect = initialize
+    try:
+        await harness.session.start()
+        baseline_argv = (
+            "/bin/echo",
+            "app-server",
+            "-c",
+            harness.baseline[0],
+            "-c",
+            harness.baseline[1],
+            "-c",
+            f"sqlite_home={json.dumps(str(session._codex_home_dir))}",
+            "-c",
+            "features.memories=false",
+        )
+        assert [args[args.index("/bin/echo") :] for args in harness.spawns] == [
+            (*baseline_argv, "-c", "mcp_servers.fixture.enabled=false"),
+            baseline_argv,
+        ]
+        assert not harness.signer.closed
+        assert caplog.text.count(RELAUNCH_WITHOUT_OVERRIDES_EVENT) == 1
+        harness.hook.assert_called_once()
+        assert harness.hook.call_args.kwargs["executor"] == "codex"
+        assert harness.hook.call_args.kwargs["active_harnesses"] == ["codex"]
+    finally:
+        await harness.session.close()
+    assert harness.signer.closed
+    assert harness.signer.order.count("signer-close") == 1
+
+
+async def test_disabled_mcp_second_early_exit_is_final(signed_disabled_mcp_session, caplog):
+    from omnigent.errors import HarnessTransportClosedError
+    from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
+
+    harness = signed_disabled_mcp_session
+
+    async def initialize(*_args, **_kwargs):
+        harness.processes[-1].returncode = 1
+        raise HarnessTransportClosedError("early EOF", replay_safe=True)
+
+    harness.initialize.side_effect = initialize
+    with pytest.raises(HarnessTransportClosedError):
+        await harness.session.start()
+    assert len(harness.spawns) == 2
+    fallback = harness.plans[0].fallback_config_overrides
+    assert fallback[:2] == harness.baseline
+    assert harness.spawns[1][harness.spawns[1].index("/bin/echo") :] == (
+        "/bin/echo",
+        "app-server",
+        *(arg for override in fallback for arg in ("-c", override)),
+    )
+    assert caplog.text.count(RELAUNCH_WITHOUT_OVERRIDES_EVENT) == 1
+    assert harness.signer.closed
+    assert harness.signer.order.count("signer-close") == 1
+
+
+async def test_disabled_mcp_not_applied_early_exit_does_not_retry(disabled_mcp_session, caplog):
+    from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
+
+    harness = disabled_mcp_session
+    (harness.source_home / "config.toml").write_text("")
+
+    async def initialize(*_args, **_kwargs):
+        harness.processes[-1].returncode = 1
+        raise BrokenPipeError
+
+    harness.initialize.side_effect = initialize
+    with pytest.raises(BrokenPipeError):
+        await harness.session.start()
+    assert harness.spawns == [("/bin/echo", "app-server", "-c", "base=true")]
+    assert RELAUNCH_WITHOUT_OVERRIDES_EVENT not in caplog.text
+
+
+@pytest.mark.parametrize("active", [None, [], ["codex"]])
+async def test_disabled_mcp_launch_activation(disabled_mcp_session, active):
+    from tests._helpers.mcp_disabled_servers import launch_activation
+
+    harness = disabled_mcp_session
+    harness.session._mcp_active_harnesses = launch_activation(active)
+    try:
+        await harness.session.start()
+        assert harness.plans[0].outcome == ("applied" if active else "none")
+        baseline = ("/bin/echo", "app-server", "-c", "base=true")
+        expected = (*baseline, "-c", "mcp_servers.fixture.enabled=false") if active else baseline
+        assert harness.spawns == [expected]
+        assert harness.hook.call_args.kwargs["executor"] == "codex"
+        assert harness.hook.call_args.kwargs["active_harnesses"] == active
+    finally:
+        await harness.session.close()
+
+
+@pytest.mark.parametrize(
+    "error", [BrokenPipeError(), ConnectionResetError(), RuntimeError("live")]
+)
+async def test_disabled_mcp_live_initialize_failure_does_not_retry(
+    disabled_mcp_session, caplog, error
+):
+    from omnigent.mcp_disabled_servers import RELAUNCH_WITHOUT_OVERRIDES_EVENT
+
+    harness = disabled_mcp_session
+    harness.initialize.side_effect = error
+    with pytest.raises(type(error)):
+        await harness.session.start()
+    assert len(harness.spawns) == 1
+    assert RELAUNCH_WITHOUT_OVERRIDES_EVENT not in caplog.text
+
+
+async def test_disabled_mcp_restarts_plan_from_original_baseline(disabled_mcp_session):
+    harness = disabled_mcp_session
+    for _ in range(2):
+        await harness.session.start()
+        await harness.session.close()
+    assert harness.spawns == [
+        ("/bin/echo", "app-server", "-c", "base=true", "-c", "mcp_servers.fixture.enabled=false"),
+        ("/bin/echo", "app-server", "-c", "base=true", "-c", "mcp_servers.fixture.enabled=false"),
+    ]
+    assert [plan.fallback_config_overrides for plan in harness.plans] == [
+        ("base=true",),
+        ("base=true",),
+    ]
+    assert harness.session._codex_config_overrides == ["base=true"]

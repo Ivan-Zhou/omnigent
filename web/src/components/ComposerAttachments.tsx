@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useLayoutEffect, useState } from "react";
 import {
   Database,
   File as FileIcon,
@@ -16,9 +16,9 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
-import { attachmentKey } from "@/lib/attachments";
+import { attachmentFilename, attachmentKey } from "@/lib/attachments";
 import { ZoomableImage } from "@/components/ImageLightbox";
-import { cn } from "@/lib/utils";
+import { ComposerChipRow } from "@/components/composer/ChatComposer";
 
 /**
  * Pending (pre-send) attachments shown under the composer textarea. A supported
@@ -38,11 +38,11 @@ export function ComposerAttachments({
 }) {
   if (files.length === 0) return null;
   return (
-    <div className={cn("flex flex-wrap items-start gap-2 px-4 pb-2", className)}>
+    <ComposerChipRow className={className}>
       {files.map((file, i) => (
         <AttachmentTile key={attachmentKey(file)} file={file} onRemove={() => onRemove(i)} />
       ))}
-    </div>
+    </ComposerChipRow>
   );
 }
 
@@ -114,12 +114,12 @@ export function iconForFile(file: File): LucideIcon {
   return FileIcon;
 }
 
-/** Blob URL for an image preview, created and revoked inside one effect so the
- *  URL the committed <img> points at is never revoked early (StrictMode double
- *  mount) and never leaks. Guarded: jsdom (tests) lacks createObjectURL. */
+/** Blob URL for an image preview. A layout effect sets it before the browser paints
+ *  the tile. Created and revoked in one effect, so StrictMode's double mount never
+ *  revokes the URL the committed <img> uses, and nothing leaks. jsdom lacks createObjectURL. */
 function useObjectUrl(file: File | null): string | undefined {
   const [url, setUrl] = useState<string>();
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!file || typeof URL.createObjectURL !== "function") {
       setUrl(undefined);
       return;
@@ -135,8 +135,7 @@ function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }
   // An image whose blob can't decode falls back to the file card (spec rule 4).
   const [thumbFailed, setThumbFailed] = useState(false);
   const showThumb = file.type.startsWith("image/") && !thumbFailed;
-  // Pasted screenshots have no filename; the composer sends them as image.png.
-  const name = file.name || "image.png";
+  const name = attachmentFilename(file);
   const url = useObjectUrl(showThumb ? file : null);
 
   if (showThumb) {

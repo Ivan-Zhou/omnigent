@@ -6,6 +6,7 @@ import json
 import shutil
 from pathlib import Path
 
+import click
 import pytest
 
 from omnigent.harnesses.devin_native import bridge as bridge_module
@@ -16,6 +17,7 @@ from omnigent.harnesses.devin_native.bridge import (
     build_devin_launch_args,
     build_devin_mcp_server,
     build_devin_native_spawn_env,
+    build_devin_native_terminal_env,
     build_hook_config,
     canonical_devin_permission_mode,
     clear_agent_instructions_preamble,
@@ -47,6 +49,7 @@ from omnigent.harnesses.devin_native.bridge import (
 from omnigent.harnesses.devin_native.hook import _normalize_tool_result
 from omnigent.harnesses.devin_native.main import (
     DEVIN_EFFORTS,
+    build_fusion_descriptor,
     compose_devin_model,
     family_effort_variants,
     list_devin_cli_model_options,
@@ -168,6 +171,18 @@ class TestComposeModel:
                 f"claude-opus-5-{effort}"
             )
 
+    def test_a_fusion_variant_is_never_recomposed(self) -> None:
+        # A fusion id bakes the lead effort in and appends the sidekick; the flat
+        # rungs do not apply, so any effort passed alongside it is ignored.
+        uid = "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium"
+        for effort in (None, "low", "max"):
+            assert compose_devin_model(uid, effort, families=_FUSION_CATALOG) == uid
+
+    def test_the_bare_fusion_slug_defers_to_devin_default(self) -> None:
+        # "fusion" alone is not a launchable variant; hand Devin the family so it
+        # resolves its own default rather than a rung-derived guess.
+        assert compose_devin_model("fusion", "high", families=_FUSION_CATALOG) == "fusion"
+
 
 class TestFamilyEffortVariants:
     """The rung ladder the web picker offers for one model."""
@@ -221,6 +236,103 @@ _FAMILY_SWE2: dict[str, object] = {
     "aliases": ["swe"],
     "variants": [{"model_uid": f"swe-2-{rung}"} for rung in ("high", "medium", "max")],
 }
+
+#: A trimmed Fusion catalog: the fusion family plus the lead/sidekick families its
+#: variant halves resolve against for labels. Exercises a fast lead, a bare-family
+#: sidekick (glm-5-2), and a priority sidekick.
+_FUSION_FAMILY: dict[str, object] = {
+    "slug": "fusion",
+    "family_label": "Fusion",
+    "variants": [
+        {"model_uid": "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium"},
+        {"model_uid": "fusion-claude-fable-5-1-high-sidekick-swe-2-high"},
+        {"model_uid": "fusion-claude-opus-5-high-fast-sidekick-glm-5-2"},
+        {"model_uid": "fusion-claude-opus-5-xhigh-sidekick-gpt-5-6-sol-high-priority"},
+    ],
+}
+_FUSION_CATALOG: list[dict[str, object]] = [
+    _FUSION_FAMILY,
+    {
+        "slug": "claude-fable-5.1",
+        "family_label": "Claude Fable 5.1",
+        "variants": [{"model_uid": f"claude-fable-5-1-{r}"} for r in ("medium", "high")],
+    },
+    {
+        "slug": "claude-opus-5",
+        "family_label": "Claude Opus 5",
+        "variants": [
+            {"model_uid": "claude-opus-5-high-fast"},
+            {"model_uid": "claude-opus-5-xhigh"},
+        ],
+    },
+    {
+        "slug": "swe-2",
+        "family_label": "SWE-2",
+        "variants": [{"model_uid": f"swe-2-{r}"} for r in ("medium", "high")],
+    },
+    {"slug": "glm-5.2", "family_label": "GLM-5.2", "variants": [{"model_uid": "glm-5-2"}]},
+    {
+        "slug": "gpt-5.6-sol",
+        "family_label": "GPT-5.6 Sol",
+        "variants": [
+            {"model_uid": "gpt-5-6-sol-high"},
+            {"model_uid": "gpt-5-6-sol-high-priority"},
+        ],
+    },
+]
+
+
+class TestFusionDescriptor:
+    """Fusion decomposes ``fusion-<lead>-sidekick-<sidekick>`` into picker facets."""
+
+    def _descriptor(self) -> dict[str, object]:
+        desc = build_fusion_descriptor(_FUSION_FAMILY, _FUSION_CATALOG)
+        assert desc is not None
+        return desc
+
+    def test_default_is_the_first_catalog_combo(self) -> None:
+        # Catalog order is preserved, so the first variant is the sensible default.
+        assert self._descriptor()["default"] == (
+            "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium"
+        )
+
+    def test_parses_lead_family_effort_and_sidekick(self) -> None:
+        combos = {c["modelUid"]: c for c in self._descriptor()["combos"]}
+        c = combos["fusion-claude-fable-5-1-medium-sidekick-swe-2-medium"]
+        assert c["lead"] == "claude-fable-5.1"
+        assert c["leadLabel"] == "Claude Fable 5.1"
+        assert c["effort"] == "medium"
+        assert c["fast"] is False
+        assert c["sidekick"] == "swe-2-medium"
+        assert c["sidekickLabel"] == "SWE-2 Medium"
+        assert c["priority"] is False
+
+    def test_parses_a_fast_lead_and_bare_family_sidekick(self) -> None:
+        combos = {c["modelUid"]: c for c in self._descriptor()["combos"]}
+        c = combos["fusion-claude-opus-5-high-fast-sidekick-glm-5-2"]
+        assert c["lead"] == "claude-opus-5"
+        assert c["effort"] == "high"
+        assert c["fast"] is True
+        # A sidekick with no effort rung labels as the bare family.
+        assert c["sidekick"] == "glm-5-2"
+        assert c["sidekickLabel"] == "GLM-5.2"
+        assert c["priority"] is False
+
+    def test_parses_a_priority_sidekick(self) -> None:
+        combos = {c["modelUid"]: c for c in self._descriptor()["combos"]}
+        c = combos["fusion-claude-opus-5-xhigh-sidekick-gpt-5-6-sol-high-priority"]
+        assert c["effort"] == "xhigh"
+        # Priority is stripped from the sidekick key and surfaced as a flag.
+        assert c["sidekick"] == "gpt-5-6-sol-high"
+        assert c["sidekickLabel"] == "GPT-5.6 Sol High"
+        assert c["priority"] is True
+
+    def test_every_combo_maps_to_a_real_variant(self) -> None:
+        real = {v["model_uid"] for v in _FUSION_FAMILY["variants"]}
+        assert {c["modelUid"] for c in self._descriptor()["combos"]} == real
+
+    def test_a_family_with_no_fusion_variants_yields_none(self) -> None:
+        assert build_fusion_descriptor(_FAMILY_SWE2, _FUSION_CATALOG) is None
 
 
 class TestResolveLaunchModel:
@@ -493,6 +605,18 @@ class TestAgentInstructionsPreamble:
 class TestLaunchArgs:
     """Omnigent owns resume, workspace trust and the transcript export."""
 
+    def test_missing_cli_still_rejects_launch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from omnigent.harnesses.devin_native import main as devin_native
+
+        monkeypatch.setattr(devin_native, "resolve_cli_binary", lambda *_args, **_kwargs: None)
+        with pytest.raises(click.ClickException, match="requires the 'devin' CLI"):
+            devin_native.build_devin_launch(
+                [],
+                bridge_dir=Path("/b"),
+                config_path=Path("/b/devin_config.json"),
+                export_file=Path("/b/transcript.atif.json"),
+            )
+
     def _args(self, **kwargs: object) -> list[str]:
         return build_devin_launch_args(
             kwargs.pop("passthrough", []),  # type: ignore[arg-type]
@@ -613,6 +737,23 @@ class TestSpawnEnv:
         assert env["HARNESS_DEVIN_NATIVE_REQUEST_SESSION_ID"] == "conv_abc123"
         assert Path(env["HARNESS_DEVIN_NATIVE_BRIDGE_DIR"]).is_dir()
 
+    @pytest.mark.usefixtures("_isolated_bridge_root")
+    def test_terminal_env_keeps_variables_forwarded_for_the_session(self) -> None:
+        env = build_devin_native_terminal_env(
+            "conv_abc123",
+            source_env={
+                "PATH": "/usr/bin",
+                "OMNIGENT_RUNNER_SESSION_ENV_NAMES": "ARCATERM_CAPABILITY,ARCATERM_PROJECTS_ROOT",
+                "ARCATERM_CAPABILITY": "capability-for-pane-1",
+                "ARCATERM_PROJECTS_ROOT": "",
+                "UNLISTED_SECRET": "nope",
+            },
+        )
+        assert env["ARCATERM_CAPABILITY"] == "capability-for-pane-1"
+        assert env["ARCATERM_PROJECTS_ROOT"] == ""
+        assert env["PATH"] == "/usr/bin"
+        assert "UNLISTED_SECRET" not in env
+
 
 class TestNormalizeToolResult:
     """Devin sends ``tool_response``; the shared policy seam reads ``tool_output``."""
@@ -689,6 +830,26 @@ class TestModelOptions:
         )
         with pytest.raises(ValueError, match="did not contain any valid families"):
             list_devin_cli_model_options()
+
+    def test_fusion_gets_a_structured_descriptor_not_effort_rungs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Fusion variant ids end in the sidekick suffix, so the flat rung extractor
+        # would mis-read them; the family must instead carry a `fusion` descriptor
+        # and no bogus `efforts`.
+        monkeypatch.setattr(
+            "omnigent.harnesses.devin_native.main._run_devin_models_list",
+            lambda **_kw: {"families": _FUSION_CATALOG},
+        )
+        by_id = {option["id"]: option for option in list_devin_cli_model_options()}
+        fusion = by_id["fusion"]
+        assert "efforts" not in fusion
+        assert "supportedReasoningEfforts" not in fusion
+        descriptor = fusion["fusion"]
+        assert descriptor["default"] == "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium"
+        assert len(descriptor["combos"]) == 4
+        # A normal family beside it still gets its effort rungs.
+        assert by_id["swe-2"]["efforts"] == ["medium", "high"]
 
 
 # Devin's own queue strip, verbatim from a pane where a message was submitted
@@ -962,6 +1123,58 @@ class TestUserConfigJsonc:
         assert _read_user_config(self._write(tmp_path, "{not json at all")) == {}
 
 
+@pytest.mark.parametrize(
+    ("server_url", "expected_trust_env"),
+    [
+        ("http://127.0.0.1:8787", False),
+        ("https://omnigents.example.databricksapps.com", True),
+    ],
+)
+def test_mirror_permission_request_bypasses_proxy_only_for_loopback(
+    monkeypatch: pytest.MonkeyPatch, server_url: str, expected_trust_env: bool
+) -> None:
+    """The approval mirror bypasses an ambient proxy only for a loopback relay."""
+    import httpx
+
+    from omnigent.harnesses.devin_native import hook as devin_hook
+
+    captured_trust_env: list[object] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object, trust_env: bool) -> None:
+            del headers, timeout
+            captured_trust_env.append(trust_env)
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, json: object = None) -> httpx.Response:
+            del json
+            return httpx.Response(
+                200,
+                text='{"hookSpecificOutput": {"decision": {"behavior": "allow"}}}',
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(devin_hook.httpx, "Client", _Client)
+    monkeypatch.setenv("_OMNIGENT_AUTH_HEADERS", json.dumps({"Authorization": "Bearer token"}))
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda server_url=None: lambda: "fresh",
+    )
+
+    verdict = devin_hook._mirror_permission_request(
+        {"hook_event_name": "PermissionRequest", "tool_name": "write"},
+        server_url=server_url,
+        session_id="conv_abc",
+    )
+    assert verdict == {"decision": "approve"}
+    assert captured_trust_env == [expected_trust_env]
+
+
 class TestPermissionRequestReauth:
     """Devin's approval card must survive the launch bearer expiring.
 
@@ -983,7 +1196,9 @@ class TestPermissionRequestReauth:
         elicitation_ids: list[str] = []
 
         class _ScriptedClient:
-            def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            def __init__(
+                self, *, headers: dict[str, str], timeout: object, **_kwargs: object
+            ) -> None:
                 del timeout
                 self._headers = headers
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from omnigent.entities import Conversation
@@ -84,11 +86,12 @@ def _conversation(
     )
 
 
-def _hello(*, harnesses: list[str]) -> HelloFrame:
+def _hello(*, harnesses: list[str], capabilities: list[str] | None = None) -> HelloFrame:
     """
     Build a runner hello frame.
 
     :param harnesses: Harness kinds advertised by the runner.
+    :param capabilities: Capability tokens advertised by the runner.
     :returns: A :class:`HelloFrame`.
     """
     return HelloFrame(
@@ -96,6 +99,7 @@ def _hello(*, harnesses: list[str]) -> HelloFrame:
         frame_protocol_version=1,
         harnesses=harnesses,
         envs=["os_sandbox"],
+        capabilities=capabilities or [],
     )
 
 
@@ -177,6 +181,40 @@ async def test_runner_router_requires_existing_runner_binding() -> None:
 
         _assert_omnigent_error(excinfo, code=ErrorCode.CONFLICT)
         assert conversation.runner_id is None
+    finally:
+        await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runner_router_wait_for_runner_resolves_when_runner_registers() -> None:
+    """The reconnect wait answers False on timeout and True once the runner registers."""
+    registry = TunnelRegistry()
+    router = RunnerRouter(registry=registry, conversation_store=_ConversationStore({}))  # type: ignore[arg-type]
+    try:
+        assert await router.wait_for_runner("runner_one", timeout_s=0.05) is False
+
+        waiter = asyncio.create_task(router.wait_for_runner("runner_one", timeout_s=5.0))
+        await asyncio.sleep(0)
+        registry.register("runner_one", _FakeWebSocket(), _hello(harnesses=["codex"]))
+
+        assert await waiter is True
+    finally:
+        await router.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runner_router_reports_advertised_capabilities() -> None:
+    """Only a connected runner that advertised the token has the capability."""
+    registry = TunnelRegistry()
+    registry.register(
+        "runner_new", _FakeWebSocket(), _hello(harnesses=["codex"], capabilities=["feature_x"])
+    )
+    registry.register("runner_old", _FakeWebSocket(), _hello(harnesses=["codex"]))
+    router = RunnerRouter(registry=registry, conversation_store=_ConversationStore({}))  # type: ignore[arg-type]
+    try:
+        assert router.runner_has_capability("runner_new", "feature_x") is True
+        assert router.runner_has_capability("runner_old", "feature_x") is False
+        assert router.runner_has_capability("runner_offline", "feature_x") is False
     finally:
         await router.aclose()
 

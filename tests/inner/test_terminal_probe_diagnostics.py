@@ -103,7 +103,7 @@ async def test_unavailable_error_retains_both_probes_before_cleanup(
         handler.setFormatter(RedactingLogFormatter(use_colors=False))
         terminal_mod.logger.addHandler(handler)
         try:
-            with caplog.at_level(logging.ERROR, logger=terminal_mod.__name__):
+            with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
                 await _run_watcher(instance, threaded, cleanup)
         finally:
             terminal_mod.logger.removeHandler(handler)
@@ -112,7 +112,11 @@ async def test_unavailable_error_retains_both_probes_before_cleanup(
     assert not tmp_path.exists()
     assert not instance.running
     assert commands == ["capture-pane", "has-session"] * 3
-    records = [r for r in caplog.records if r.name == terminal_mod.__name__]
+    records = [
+        r
+        for r in caplog.records
+        if r.name == terminal_mod.__name__ and "tmux unavailable after" in r.getMessage()
+    ]
     assert len(records) == 1
     record = records[0]
     assert record.event_name == "terminal_unavailable"
@@ -192,7 +196,7 @@ async def test_probe_history_resets_on_recovery(
     await _run_watcher(instance, threaded, lambda: None)
 
     assert tick == 6
-    record = next(r for r in caplog.records if r.levelno == logging.ERROR)
+    record = next(r for r in caplog.records if "tmux unavailable after" in r.getMessage())
     failures = json.loads(record.attributes["probe_failures_json"])
     assert len(failures) == 6
     assert {failure["error"] for failure in failures} == {"can't find session: after recovery"}
@@ -218,8 +222,8 @@ def test_probe_evidence_is_bounded_and_redacted(
         )
         instance._remember_probe_failure("capture-pane", error, terminal_mod.time.monotonic())
 
-    instance._log_tmux_unavailable(3)
-    record = next(r for r in caplog.records if r.levelno == logging.ERROR)
+    instance._log_tmux_unavailable(3, exit_callback_present=False)
+    record = next(r for r in caplog.records if "tmux unavailable after" in r.getMessage())
     failures = json.loads(record.attributes["probe_failures_json"])
     assert len(failures) == 6
     assert all(len(failure["error"]) <= 1024 for failure in failures)
@@ -245,7 +249,49 @@ def test_socket_stat_failure_does_not_hide_probe_error(
         return real_stat(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", stat)
-    instance._log_tmux_unavailable(3)
-    record = next(r for r in caplog.records if r.levelno == logging.ERROR)
+    instance._log_tmux_unavailable(3, exit_callback_present=False)
+    record = next(r for r in caplog.records if "tmux unavailable after" in r.getMessage())
     assert record.attributes["socket_state"] == "stat_failed"
     assert record.attributes["socket_stat_errno"] == errno.EACCES
+
+
+@pytest.mark.parametrize(
+    ("stderr", "keep_alive_after_exit", "killed_by_tmux"),
+    [
+        ("no current target", True, True),
+        ("can't find session: main", True, True),
+        # The socket outlived its server, e.g. after ``killall tmux``.
+        ("no server running on /tmp/omnigent-terminal-x/tmux.sock", True, True),
+        (
+            "error connecting to /tmp/omnigent-terminal-x/tmux.sock (No such file or directory)",
+            True,
+            False,
+        ),
+        ("no current target", False, False),
+    ],
+)
+async def test_session_killed_by_tmux_reads_the_has_session_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stderr: str,
+    keep_alive_after_exit: bool,
+    killed_by_tmux: bool,
+) -> None:
+    """A kept-alive session tmux lost, or whose server died, reads as killed by tmux."""
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+        keep_alive_after_exit=keep_alive_after_exit,
+    )
+
+    def run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, b"", stderr.encode())
+
+    _patch_tmux(monkeypatch, run)
+    await _run_watcher(instance, False, lambda: None)
+
+    assert not instance.running
+    assert instance.session_killed_by_tmux() is killed_by_tmux

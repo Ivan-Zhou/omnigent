@@ -31,11 +31,11 @@ from playwright.async_api import Route, async_playwright
 from playwright.async_api import expect as expect_async
 from playwright.sync_api import Page, expect
 
+from tests._helpers.polling import poll_until_async
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
     _register_common_routes,
     _run_in_fresh_loop,
-    _wait_until,
 )
 
 _COMPOSER = "Send a message…"
@@ -88,7 +88,9 @@ async def _drive_landing_image_only(base_url: str, session_id: str, png: Path) -
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             # Registered after _register_common_routes so this handler wins
             # for /events: capture the auto-dispatched first message instead
@@ -132,7 +134,7 @@ async def _drive_landing_image_only(base_url: str, session_id: str, png: Path) -
             await expect_async(submit).to_be_enabled(timeout=10_000)
             await submit.click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
 
             # The first message auto-dispatches after navigation and must be
             # exactly the image the user attached — no fabricated text.
@@ -147,7 +149,7 @@ async def _drive_landing_image_only(base_url: str, session_id: str, png: Path) -
                         return True
                 return False
 
-            await _wait_until(_image_message_posted, timeout_s=30.0)
+            await poll_until_async(_image_message_posted, timeout_s=30.0)
         finally:
             # Explicit context close finalizes any requested video recording.
             await page.context.close()

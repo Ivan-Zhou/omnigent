@@ -59,7 +59,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
+from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
+from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentStart, read_subagent_events
@@ -87,6 +89,13 @@ from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.process_logging import current_process_log_path, display_log_path
 
 logger = logging.getLogger(__name__)
+
+ACP_CANCEL_GRACE_SECONDS = 1.0
+_ACP_TERMINATION_TIMEOUT_SECONDS = 5.0
+_ACP_CLEANUP_HEADROOM_SECONDS = 1.0
+ACP_REAP_TIMEOUT_SECONDS = (
+    ACP_CANCEL_GRACE_SECONDS + _ACP_TERMINATION_TIMEOUT_SECONDS + _ACP_CLEANUP_HEADROOM_SECONDS
+)
 
 # ACP's JSON-RPC schema is agent-owned and extensible; consumers narrow fields
 # before use.
@@ -227,6 +236,23 @@ class AcpAgentConfig:
         plain user content and lets the agent's own system prompt take effect
         unmodified. When ``omnigent_mcp`` is ``False`` and the agent manages its
         own context, setting this to ``False`` is strongly recommended.
+    :param available_models: Curated model ids from the agent's explicitly bound
+        provider (``HARNESS_ACP_MODEL_LIST``). Empty (the default) means nothing was
+        curated: every model the agent accepts is allowed. When set, warm
+        ``session/set_config_option`` switches to ids outside the list are
+        withheld — the ACP counterpart of pi-native's ``enabledModels`` scoping
+        (the vendor CLI owns its own picker, so the gate sits at the switch).
+    :param env_unset: Environment variable *names* stripped from the spawn env
+        handed to the vendor CLI (``HARNESS_ACP_ENV_UNSET``). Operator-declared:
+        some CLIs activate built-in providers on the mere presence of a
+        credential variable (any value), e.g. dummy tokens other harnesses
+        project — scrubbing them keeps the CLI's own picker from bypassing the
+        curated set. Applied on top of the deny-by-default allowlist, so a name
+        can be both passed through and later removed deliberately. Empty (the
+        default) means no scrubbing.
+    :param default_model: Model to restore when a per-turn override is cleared.
+        ``None`` preserves the launch-model fallback; an empty string uses the
+        model originally reported by the ACP session.
     """
 
     command: str
@@ -238,6 +264,13 @@ class AcpAgentConfig:
     env_passthrough: tuple[str, ...] = ()
     permission_mode: str = "auto"
     inject_system_prompt: bool = True
+    available_models: tuple[str, ...] = ()
+    env_unset: tuple[str, ...] = ()
+    default_model: str | None = None
+
+
+class _AcpModelSwitchError(RuntimeError):
+    """A rejected model selection, before the ACP prompt is sent."""
 
 
 class _AcpRequestError(Exception):
@@ -356,6 +389,61 @@ def _unattended_auth_method_id(initialize_result: _AcpJsonObject) -> str | None:
     return None
 
 
+def _resolve_cwd(cwd: str | None, *, session_id: str | None = None) -> str:
+    """Resolve and validate the working directory for the ACP agent subprocess.
+
+    Called from :meth:`AcpExecutor.__init__` (where *cwd* may be ``None``) and
+    from :meth:`AcpExecutor._start_process` (where *cwd* is always a string, to
+    re-validate before every spawn and respawn). Raises a clear
+    :class:`RuntimeError` so the failure goes through the normal startup-error
+    path and surfaces with the harness-log suffix.
+
+    On Linux, reads ``/proc/self/cwd`` to recover a deleted inherited path
+    (shown as ``<path> (deleted)``).
+
+    :param cwd: Caller-supplied directory, or ``None`` to inherit from the process.
+    :param session_id: Session id for the structured WARNING, when available.
+    :returns: The resolved working directory path.
+    :raises RuntimeError: When the directory is missing or the process cwd was deleted.
+    """
+    if cwd is not None:
+        if not os.path.isdir(cwd):
+            logger.warning(
+                "acp executor cwd does not exist: %s",
+                cwd,
+                extra=debug_event(
+                    "acp_executor_cwd_missing",
+                    session_id=session_id,
+                    cwd=cwd,
+                    reason="not_a_directory",
+                ),
+            )
+            raise RuntimeError(f"ACP executor working directory does not exist: {cwd!r}")
+        return cwd
+
+    try:
+        return os.getcwd()
+    except FileNotFoundError:
+        deleted_path: str | None = None
+        with contextlib.suppress(OSError):
+            deleted_path = os.readlink("/proc/self/cwd").removesuffix(" (deleted)")
+        path_detail = f" ({deleted_path})" if deleted_path else ""
+        logger.warning(
+            "acp executor inherited working directory was deleted%s",
+            path_detail,
+            extra=debug_event(
+                "acp_executor_cwd_missing",
+                session_id=session_id,
+                cwd=deleted_path,
+                reason="inherited_cwd_deleted",
+            ),
+        )
+        raise RuntimeError(
+            f"Runner working directory was deleted{path_detail}; "
+            "restart the runner in a valid directory or pass an explicit cwd"
+        ) from None
+
+
 class AcpExecutor(Executor):
     """Executor that drives any ACP agent over JSON-RPC 2.0 on stdio."""
 
@@ -382,7 +470,7 @@ class AcpExecutor(Executor):
         """
         self._config = config
         self._extension = extension
-        self._cwd = cwd or os.getcwd()
+        self._cwd = _resolve_cwd(cwd)
         self._os_env = os_env
         # Advertise ``clientCapabilities.fs`` so the agent delegates file
         # reads/writes back to us (executed through the Omnigent OSEnvironment,
@@ -396,6 +484,8 @@ class AcpExecutor(Executor):
         # and the live model value, both learned from ``config_option_update``.
         self._config_option_ids: set[str] = set()
         self._active_model: str | None = None
+        self._model_config_option_id: str | None = None
+        self._initial_model: str | None = None
         # Latches off once an agent proves it can't warm-switch, so we don't
         # retry a failing request on every turn.
         self._model_switch_supported: bool = True
@@ -420,6 +510,8 @@ class AcpExecutor(Executor):
 
         self._rpc_id: int = 0
         self._pending: dict[int, asyncio.Future[_AcpJsonObject]] = {}
+        self._active_prompt_request_id: int | None = None
+        self._cancel_grace_deadline: float | None = None
 
         self._session_id: str | None = None
         self._initialized: bool = False
@@ -477,6 +569,14 @@ class AcpExecutor(Executor):
         The StreamReader limit is raised to 16 MiB so a large ``session/new``
         response or tool-output line can't hit the default 64 KiB per-line cap.
         """
+        # Re-validate cwd before every spawn and respawn: the workspace may have
+        # been deleted after __init__, and this error flows through
+        # _startup_error_message so the UI also shows the harness-log path.
+        _resolve_cwd(self._cwd, session_id=self._session_id)
+        # If the cwd is relative the spawn resolves it against the process cwd;
+        # fail early with a clear message if that directory was also deleted.
+        if not os.path.isabs(self._cwd):
+            _resolve_cwd(None, session_id=self._session_id)
         # Reset handshake state: this may be a restart after the previous
         # subprocess died. ``_initialized`` is a one-way latch.
         self._initialized = False
@@ -511,7 +611,7 @@ class AcpExecutor(Executor):
         startup) when no sandbox is requested or the backend is unavailable.
 
         ponytail: a sandboxed *generic* agent gets only its binary dir (read),
-        the cwd, and ``/tmp`` (write) — we can't know an arbitrary agent's config
+        the cwd, and private scratch space (write) — we can't know an arbitrary agent's config
         dir. An agent that must write its own config under a sandbox needs
         ``sandbox: none`` (the default) for now; per-agent write roots is a
         documented follow-up.
@@ -529,7 +629,6 @@ class AcpExecutor(Executor):
                 create_exec_launcher,
                 resolve_sandbox,
                 with_additional_read_roots,
-                with_additional_write_roots,
                 with_spawn_env_allowlist,
             )
 
@@ -540,7 +639,6 @@ class AcpExecutor(Executor):
             resolved_bin = Path(binary)
             if resolved_bin.parent != Path(".") and resolved_bin.exists():
                 sandbox = with_additional_read_roots(sandbox, [resolved_bin.resolve().parent])
-            sandbox = with_additional_write_roots(sandbox, [Path("/tmp")])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(binary, sandbox), rest
         except (OSError, ImportError, NotImplementedError) as exc:
@@ -632,6 +730,26 @@ class AcpExecutor(Executor):
                 # check prevents a colliding request from mis-resolving our future.
                 if msg_id is not None and "method" not in msg and msg_id in self._pending:
                     fut = self._pending.pop(msg_id)
+                    if msg_id == self._active_prompt_request_id:
+                        # run_turn may already be cancelled when the response arrives.
+                        error = msg.get("error")
+                        if isinstance(error, dict):
+                            logger.debug(
+                                "acp[%s] session/prompt %s error code=%s message=%s",
+                                self._config.name,
+                                msg_id,
+                                error.get("code"),
+                                error.get("message"),
+                            )
+                        else:
+                            result = msg.get("result", {})
+                            reason = result.get("stopReason") if isinstance(result, dict) else None
+                            logger.debug(
+                                "acp[%s] session/prompt %s stopReason=%s",
+                                self._config.name,
+                                msg_id,
+                                reason,
+                            )
                     if not fut.done():
                         fut.set_result(msg)
                 else:
@@ -670,7 +788,7 @@ class AcpExecutor(Executor):
         await self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             self._pending.pop(req_id, None)
             # asyncio.TimeoutError carries no message, so a caller reporting it
             # by str() would surface a blank failure. Name the stalled call.
@@ -704,6 +822,7 @@ class AcpExecutor(Executor):
                 *getattr(config, "env_passthrough", ()),
                 *declared_passthrough(self._os_env),
             ),
+            deny_exact=getattr(config, "env_unset", ()),
         )
 
     def _warn_initialize_failed(self, reason: str) -> None:
@@ -860,6 +979,7 @@ class AcpExecutor(Executor):
         if isinstance(result, dict):
             self._note_config_options(result.get("configOptions"))
             self._note_session_models(result.get("models"))
+        self._initial_model = self._active_model
         return self._session_id
 
     def _note_session_models(self, models: object) -> None:
@@ -1336,6 +1456,10 @@ class AcpExecutor(Executor):
     def supports_streaming(self) -> bool:
         return True
 
+    def preserves_empty_initiating_message(self) -> bool:
+        """Keep the initiating item identity even when its ACP prompt is empty."""
+        return True
+
     def max_context_tokens(self) -> int | None:
         """Return the agent's reported context-window size, if observed yet."""
         return self._context_window
@@ -1421,6 +1545,7 @@ class AcpExecutor(Executor):
     def _reset_session_state(self) -> None:
         """Forget state that is only valid for the current ACP session."""
         self._session_id = None
+        self._initial_model = None
         self._system_prompt_sent = False
         self._tool_names.clear()
         self._tool_inputs.clear()
@@ -1537,7 +1662,7 @@ class AcpExecutor(Executor):
         """
         if not isinstance(options, list):
             return None
-        model_value: str | None = None
+        model_option: _AcpJsonObject | None = None
         for opt in options:
             if not isinstance(opt, dict):
                 continue
@@ -1545,12 +1670,20 @@ class AcpExecutor(Executor):
             if not isinstance(opt_id, str):
                 continue
             self._config_option_ids.add(opt_id)
-            if opt_id == _CONFIG_OPTION_MODEL:
-                current = opt.get("currentValue")
-                if isinstance(current, str) and current:
-                    self._active_model = current
-                    model_value = current
-        return model_value
+            # An option literally named ``model`` wins; otherwise the first one
+            # in the model category, so several matches resolve deterministically.
+            if opt_id == _CONFIG_OPTION_MODEL or (
+                model_option is None and opt.get("category") == _CONFIG_OPTION_MODEL
+            ):
+                model_option = opt
+        if model_option is None:
+            return None
+        self._model_config_option_id = model_option["id"]
+        current = model_option.get("currentValue")
+        if not isinstance(current, str) or not current:
+            return None
+        self._active_model = current
+        return current
 
     async def _apply_model_override(self, session_id: str, model: str | None) -> None:
         """Warm-switch the agent's model via ACP ``session/set_config_option``.
@@ -1560,20 +1693,32 @@ class AcpExecutor(Executor):
         the session is not recreated — so a ``/model`` pick mid-conversation keeps
         the history the agent has already built up.
 
-        No-ops when the model is unset, already active, or the agent never
-        advertised a ``model`` option. A failed attempt latches the feature off
-        for this process rather than re-requesting on every turn, and never fails
-        the turn: an agent that can't switch should still answer on the model it
-        has.
+        Curated sessions fail the turn if the requested model cannot be selected.
+        Uncurated sessions retain the fallback to the current model and disable
+        unsupported switching for this process.
 
         :param session_id: The live ACP session to reconfigure.
-        :param model: Requested model id, or ``None`` to leave it alone.
+        :param model: Requested model id, or ``None`` to restore the configured default.
         """
-        # A turn carries a model only when the user picked one; fall back to the
-        # agent's configured ``model:`` so a configured id is actually applied
-        # instead of leaving the agent on its own default.
-        model = model or self._config.model
-        if not model or model == self._active_model or not self._model_switch_supported:
+        # A launch override must not replace the default restored by later turns.
+        default_model = self._config.default_model
+        if default_model is None:
+            default_model = self._config.model
+        elif not default_model:
+            default_model = self._initial_model
+        model = model or default_model
+        if not model:
+            return
+        available = getattr(self._config, "available_models", ())
+        if available and model not in available:
+            raise _AcpModelSwitchError(
+                f"Model {model!r} is not in this ACP agent's configured model list."
+            )
+        if model == self._active_model:
+            return
+        if not self._model_switch_supported:
+            if available:
+                raise _AcpModelSwitchError(f"ACP agent cannot switch to model {model!r}.")
             return
         # An agent that returned a model catalog from ``session/new`` selects
         # models with ``session/set_model`` and never advertises a ``model``
@@ -1582,9 +1727,12 @@ class AcpExecutor(Executor):
         if self._session_model_ids:
             await self._set_model_via_catalog(session_id, model)
             return
-        # Before the first ``config_option_update`` we don't know what's settable;
-        # attempting is harmless because a rejection just latches the feature off.
-        if self._config_option_ids and _CONFIG_OPTION_MODEL not in self._config_option_ids:
+        # Before the first config update, the RPC response determines support.
+        if self._config_option_ids and self._model_config_option_id is None:
+            if available:
+                raise _AcpModelSwitchError(
+                    f"ACP agent exposes no model option for switching to {model!r}."
+                )
             self._model_switch_supported = False
             logger.info(
                 "acp[%s] agent exposes no %r config option; leaving model as-is",
@@ -1595,9 +1743,18 @@ class AcpExecutor(Executor):
 
         response = await self._rpc(
             _AGENT_METHOD_SET_CONFIG_OPTION,
-            {"sessionId": session_id, "configId": _CONFIG_OPTION_MODEL, "value": model},
+            {
+                "sessionId": session_id,
+                "configId": self._model_config_option_id or _CONFIG_OPTION_MODEL,
+                "value": model,
+            },
         )
         if "error" in response:
+            if available:
+                raise _AcpModelSwitchError(
+                    f"ACP agent rejected model {model!r}: "
+                    f"{response['error'].get('message', response['error'])}"
+                )
             self._model_switch_supported = False
             logger.warning(
                 "acp[%s] model switch to %s rejected (%s); continuing on the current model",
@@ -1620,6 +1777,10 @@ class AcpExecutor(Executor):
         )
         if echoed_model is None:
             self._active_model = model
+        elif available and echoed_model != model:
+            raise _AcpModelSwitchError(
+                f"ACP agent selected {echoed_model!r} instead of requested model {model!r}."
+            )
         logger.info(
             "acp[%s] model set to %s (transcript kept)", self._config.name, self._active_model
         )
@@ -1629,8 +1790,8 @@ class AcpExecutor(Executor):
 
         Used for agents that advertise a catalog in ``session/new`` rather than a
         ``model`` config option. Like the config-option path this preserves the
-        transcript, never fails the turn, and latches the feature off on
-        rejection.
+        transcript. A rejection fails curated turns; uncurated sessions retain
+        their current model and disable further switch attempts.
 
         The requested id is *not* checked against ``availableModels``: that list
         is what the agent offers interactively, and an id outside it can still be
@@ -1645,6 +1806,11 @@ class AcpExecutor(Executor):
             _AGENT_METHOD_SET_MODEL, {"sessionId": session_id, "modelId": model}
         )
         if "error" in response:
+            if self._config.available_models:
+                raise _AcpModelSwitchError(
+                    f"ACP agent rejected model {model!r}: "
+                    f"{response['error'].get('message', response['error'])}"
+                )
             self._model_switch_supported = False
             logger.warning(
                 "acp[%s] %s to %s rejected (%s); continuing on the current model",
@@ -1662,6 +1828,31 @@ class AcpExecutor(Executor):
             _AGENT_METHOD_SET_MODEL,
         )
 
+    async def _drain_stale_queue(self) -> None:
+        """Drain items queued before the next prompt without losing what they carry.
+
+        Leftover agent requests are answered; a queued ``config_option_update``
+        (agents often report their model right after ``session/new``) is noted
+        rather than lost, so the model it names and its option id are current.
+        """
+        while not self._queue.empty():
+            try:
+                stale = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not isinstance(stale, dict):
+                continue
+            if stale.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE:
+                params = stale.get("params")
+                update = params.get("update") if isinstance(params, dict) else None
+                if (
+                    isinstance(update, dict)
+                    and update.get("sessionUpdate") == _UPDATE_CONFIG_OPTION
+                ):
+                    self._note_config_options(update.get("configOptions"))
+            elif stale.get("id") is not None and stale.get("method"):
+                await self._respond_to_agent_request(stale)
+
     async def run_turn(
         self,
         messages: list[Message],
@@ -1675,6 +1866,9 @@ class AcpExecutor(Executor):
         tool-call cards) as the agent works, answering any
         ``session/request_permission`` mid-turn, until the final response
         (``stopReason``) arrives — then yields ``TurnComplete`` with usage.
+
+        Every prompt carries ``_meta["ai.omnigent/inputItemId"]``: the persisted
+        user item delivered by this turn, or null for synthetic/tool recovery.
 
         ``tools`` (Omnigent's builtin tool schemas) are captured for the Omnigent
         MCP relay set up at ``session/new`` — the agent still runs its OWN tools.
@@ -1695,12 +1889,30 @@ class AcpExecutor(Executor):
             return
 
         # Apply a ``/model`` pick to the live session before prompting, so the
-        # switch takes effect on this turn with the transcript intact. Never fatal
-        # — an agent that can't switch answers on the model it already has.
+        # switch takes effect on this turn with the transcript intact. Drain first:
+        # a report queued behind ``session/new`` names the option id to target.
         requested_model = config.model if config is not None else None
+        await self._drain_stale_queue()
         try:
             await self._apply_model_override(session_id, requested_model)
         except Exception as exc:  # noqa: BLE001
+            if self._config.available_models:
+                if not isinstance(exc, _AcpModelSwitchError):
+                    # A transport failure leaves the actual selection uncertain.
+                    self._active_model = None
+                yield ExecutorError(
+                    message=f"ACP model selection failed: {describe_exception(exc)}. "
+                    "No prompt was sent; retry or select another configured model.",
+                    retryable=True,
+                    preserve_session=(
+                        isinstance(exc, (_AcpModelSwitchError, TimeoutError))
+                        and self._proc is not None
+                        and self._proc.returncode is None
+                        and self._reader_task is not None
+                        and not self._reader_task.done()
+                    ),
+                )
+                return
             self._model_switch_supported = False
             logger.warning("acp[%s] model switch failed: %s", self._config.name, exc)
 
@@ -1711,6 +1923,8 @@ class AcpExecutor(Executor):
         user_text = ""
         image_blocks: list[_AcpJsonObject] = []
         latest_user_idx: int | None = None
+        candidate_id = messages[-1].get("input_item_id") if messages else None
+        input_item_id = candidate_id if isinstance(candidate_id, str) else None
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
             role = msg.get("role", "") if isinstance(msg, dict) else ""
@@ -1751,27 +1965,27 @@ class AcpExecutor(Executor):
             prompt_blocks.append({"type": "text", "text": user_text})
         prompt_blocks.extend(image_blocks)
 
-        # Drain stale items from a prior turn; answer any leftover server request.
-        while not self._queue.empty():
-            try:
-                stale = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if isinstance(stale, dict) and stale.get("id") is not None and stale.get("method"):
-                await self._respond_to_agent_request(stale)
+        # Drain stale items from a prior turn, plus anything the switch above queued.
+        await self._drain_stale_queue()
 
         self._rpc_id += 1
         req_id = self._rpc_id
         loop = asyncio.get_event_loop()
         fut: asyncio.Future[_AcpJsonObject] = loop.create_future()
         self._pending[req_id] = fut
+        self._active_prompt_request_id = req_id
+        self._cancel_grace_deadline = None
 
         await self._send(
             {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "method": _AGENT_METHOD_SESSION_PROMPT,
-                "params": {"sessionId": session_id, "prompt": prompt_blocks},
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": prompt_blocks,
+                    "_meta": {_META_INPUT_ITEM_ID: input_item_id},
+                },
             }
         )
 
@@ -1809,7 +2023,7 @@ class AcpExecutor(Executor):
                 notification = await asyncio.wait_for(
                     self._queue.get(), timeout=min(remaining, 2.0)
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
             method = notification.get("method", "")
@@ -1846,6 +2060,11 @@ class AcpExecutor(Executor):
                     "params": {"sessionId": self._session_id},
                 }
             )
+            # Duplicate interrupts share the original deadline, even during reap.
+            if self._cancel_grace_deadline is None:
+                self._cancel_grace_deadline = (
+                    asyncio.get_running_loop().time() + ACP_CANCEL_GRACE_SECONDS
+                )
             return True
         except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
             logger.debug("acp[%s] session/cancel failed: %s", self._config.name, exc)
@@ -1854,8 +2073,26 @@ class AcpExecutor(Executor):
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; the ACP session is per-process)."""
 
+    def close_timeout(self) -> float:
+        return ACP_REAP_TIMEOUT_SECONDS
+
     async def close(self) -> None:
-        """Terminate the agent subprocess and clean up."""
+        """Allow a cancelled prompt to answer, then terminate the agent subprocess."""
+        if self._cancel_grace_deadline is not None and self._active_prompt_request_id is not None:
+            response = self._pending.get(self._active_prompt_request_id)
+            remaining = self._cancel_grace_deadline - asyncio.get_running_loop().time()
+            if response is not None and not response.done():
+                # Keep the reader and stdin alive while the cancelled prompt answers.
+                if remaining > 0:
+                    await asyncio.wait({response}, timeout=remaining)
+                if not response.done():
+                    logger.debug(
+                        "acp[%s] session/prompt %s cancel grace expired without a response",
+                        self._config.name,
+                        self._active_prompt_request_id,
+                    )
+        self._cancel_grace_deadline = None
+        self._active_prompt_request_id = None
         self._reset_session_state()
         # Tear down the Omnigent MCP relay HTTP server + its bridge dir first.
         with contextlib.suppress(Exception):
@@ -1881,7 +2118,7 @@ class AcpExecutor(Executor):
                 # Tree-aware: the handle is the sandbox launcher, not the
                 # agent it forked. A bare terminate() orphans the agent.
                 _proc.terminate_tree(self._proc)
-                await asyncio.wait_for(self._proc.wait(), timeout=5)
+                await asyncio.wait_for(self._proc.wait(), timeout=_ACP_TERMINATION_TIMEOUT_SECONDS)
             except Exception:  # noqa: BLE001
                 with contextlib.suppress(Exception):
                     _proc.kill_tree(self._proc)
