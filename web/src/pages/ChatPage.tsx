@@ -1,3 +1,5 @@
+import { clearLocalReviewContexts, usePendingLocalReviewContexts } from "@/lib/localReviewContext";
+import { formatLocalReviewComments } from "@/lib/localReviewComments";
 import { SelectionPopup } from "@/components/chat/SelectionPopup";
 import {
   EditSentMessageContext,
@@ -66,7 +68,7 @@ import {
 } from "@/components/composer/ComposerControls";
 import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { useAppName } from "@/lib/branding";
-import { hasPendingOwnElicitation } from "@/lib/blocks";
+import { hasPendingOwnElicitation, isPendingBlockingElicitation } from "@/lib/blocks";
 import { cn } from "@/lib/utils";
 import { isInlineRenameFocused } from "@/lib/inlineRename";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
@@ -81,6 +83,7 @@ import {
   BRAIN_HARNESS_LABELS,
   SMART_ROUTING_LABEL,
   useBrainHarnessLabels,
+  useFileMentionHarnesses,
   useHarnessEffortFamilies,
 } from "@/lib/agentLabels";
 import { useCanStartSideChat, usePermissions, useSessionOwner } from "@/hooks/usePermissions";
@@ -101,7 +104,7 @@ import {
 } from "@/lib/permissionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
-import { ApiError, createSideChat, retrySession } from "@/lib/sessionsApi";
+import { ApiError, createSideChat, retrySession, sendUserMessage } from "@/lib/sessionsApi";
 import { getProject } from "@/lib/projectsApi";
 import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
@@ -119,6 +122,13 @@ import {
   type PendingUserMessage,
   useChatStore,
 } from "@/store/chatStore";
+import {
+  registerContinuePlan,
+  registerSaveWorkflow,
+  registerStartWorkflow,
+  registerStopWork,
+  registerTaskAction,
+} from "@/store/sessionTasksActions";
 import { isRetryableRequestError } from "@/lib/queryRetry";
 import { useTrueForAtMost } from "@/hooks/useTrueForAtMost";
 import {
@@ -153,6 +163,7 @@ import {
   type TaggedMentions,
   withSessionMentionHint,
   detectMentionAt,
+  harnessSupportsFileMentions,
   type MentionItem,
   mentionMarkerFor,
   MENTION_MATCH_CAP,
@@ -282,6 +293,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
+import { ComposerLocalReviewChips } from "@/components/composer/ComposerLocalReviewChips";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
 import {
   SMART_ROUTING_ARMS,
@@ -313,7 +325,8 @@ import {
   nativeModelTooltip,
 } from "@/lib/composerModelLabel";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import type { ServerInfo } from "@/lib/capabilities";
+import { RewindPicker } from "@/components/RewindPicker";
+import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
@@ -349,6 +362,21 @@ import { isPermissionModeCycleKey, nextCycledPermissionMode } from "@/lib/permis
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/components/goal";
+import { SaveWorkflowDialog } from "@/components/composer/SaveWorkflowDialog";
+import { WorkflowDialog, type WorkflowRequest } from "@/components/composer/WorkflowDialog";
+import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import {
+  continuePlanMessage,
+  filterWorkflowSkills,
+  offersSaveWorkflow,
+  offersWorkflow,
+  savedWorkflowMessage,
+  saveWorkflowMessage,
+  stopPlanMessage,
+  type TaskAction,
+  taskActionMessage,
+  workflowMessage,
+} from "@/lib/workflow";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ConnectionIndicator } from "./ChatIndicators";
@@ -772,14 +800,10 @@ export function ChatPage() {
     void useChatStore.getState().send(text, agentId, files, { replyDraft });
   }, [pendingResumePrompt, runnerOnline, agentId, urlConvId]);
 
-  // Pending elicitation = parked on user input — suppress shimmer. Must
-  // sit before the early-return guards below (Rules of Hooks). Read through
-  // a boolean selector (not the whole `blocks` array): Zustand bails out when
-  // the flag is unchanged, so `blocks` reference churn on every streaming
-  // frame no longer re-renders this root — only an elicitation edge does.
-  const hasPendingElicitation = useChatStore((s) =>
-    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
-  );
+  // A pending blocking card parks the turn, so suppress shimmer. Must sit before the
+  // early returns (Rules of Hooks); a boolean selector avoids re-rendering on every
+  // streaming frame.
+  const hasPendingElicitation = useChatStore((s) => s.blocks.some(isPendingBlockingElicitation));
 
   // Single-session snapshot (shared cache with chatStore.bindStream).
   // Must be declared BEFORE the early-return guards below — otherwise
@@ -2305,6 +2329,8 @@ export function buildSlashCommandMap(
   showMcp = false,
   showClear = false,
   showPermissions = false,
+  showRewind = false,
+  showGoal = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2314,6 +2340,8 @@ export function buildSlashCommandMap(
     if (name === "/mcp" && !showMcp) continue;
     if (name === "/clear" && !showClear) continue;
     if (name === "/permissions" && !showPermissions) continue;
+    if (name === "/rewind" && !showRewind) continue;
+    if (name === "/goal" && !showGoal) continue;
     // /btw is a Claude Code CLI built-in — only offer it on claude-native.
     if (name === "/btw" && !showBtw) continue;
     // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
@@ -2324,6 +2352,16 @@ export function buildSlashCommandMap(
     m[`${skillPrefix}${skill.name}`] = skillMenuDescription(skill);
   }
   return m;
+}
+
+/** Build the same skill descriptions for leading and inline completion. */
+function buildSkillCommandMap(
+  skills: readonly SkillSummary[],
+  prefix: "/" | "$",
+): Record<string, string> {
+  return Object.fromEntries(
+    skills.map((skill) => [`${prefix}${skill.name}`, skillMenuDescription(skill)]),
+  );
 }
 
 /**
@@ -2339,6 +2377,15 @@ export function composerOffersClear(harness: string | null, info: ServerInfo | "
     (harness === "claude-native" || harness === "codex-native") &&
     !!info.session_event_types?.includes("clear")
   );
+}
+
+/** Leave /rewind as text or a project skill on older servers. */
+export function composerOffersRewind(
+  harness: string | null,
+  info: ServerInfo | "loading",
+): boolean {
+  if (info === "loading") return false;
+  return (harness === "claude-native" || harness === "claude-sdk") && info.session_rewind === true;
 }
 
 /**
@@ -2581,10 +2628,9 @@ function ComposerImpl(
   const [inputFocused, setInputFocused] = useState(false);
   // Active "@"-file-mention being typed, plus its highlighted row and the
   // workspace paths the user has already tagged. ``@``-mention is wired for
-  // the native coding-agent sessions (see ``mentionEnabled``): those harnesses
-  // run in the workspace and read a file from an "[Attached: …]" marker, so a
-  // tagged path is delivered by prepending that marker at send time — no
-  // upload, the agent reads the on-disk file directly.
+  // sessions whose agent reads a workspace file from an "[Attached: ...]" marker
+  // (see ``mentionEnabled``), so a tagged path is delivered by prepending that
+  // marker at send time - no upload, the agent reads the on-disk file directly.
   // Active "@"-mention token (owned here; the shared useMentionBrowser hook
   // owns the selection index, tagged chips, and attach/drill/keyboard glue).
   const [mention, setMention] = useState<MentionState | null>(null);
@@ -2664,16 +2710,9 @@ function ComposerImpl(
   // structural reason takes priority for the placeholder text since it
   // explains *why* this specific row can't receive input.
   const isReadOnly = isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason);
-  // A pending elicitation addressed to this session parks the turn
-  // server-side (the runner blocks on the verdict Future), so a message
-  // sent now would sit queued and unread until the card is answered —
-  // and for native wrappers the injected text could land in the vendor
-  // TUI's permission prompt. Lock the SEND path until the verdict is in
-  // (submit() guard + disabled Send button), but keep the textarea itself
-  // editable: disabling it ejects browser focus mid-word when a prompt
-  // lands while the user is typing, silently dropping their keystrokes.
-  // Mirrored sub-agent prompts (targetSessionId set to a child session)
-  // don't gate this session's inbox, so they don't lock it.
+  // This session's own blocking card parks the turn, so a message sent now
+  // would sit unread: lock Send, but keep the textarea editable so focus and
+  // keystrokes aren't lost. Mirrored sub-agent and non-blocking cards don't lock it.
   const hasPendingElicitation = useChatStore((s) =>
     hasPendingOwnElicitation(s.blocks, s.conversationId),
   );
@@ -2708,6 +2747,7 @@ function ComposerImpl(
   // tabs and coming back restores the draft. The shared draft store also lets
   // the sidebar surface which sessions have unfinished composer content.
   const conversationId = useChatStore((s) => s.conversationId);
+  const localReviewComments = usePendingLocalReviewContexts(conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const boundAgentId = useChatStore((s) => s.boundAgentId);
@@ -2936,22 +2976,23 @@ function ComposerImpl(
     return true;
   };
   useEffect(() => setGoalDialogOpen(false), [conversationId]);
-  const { goal, setGoal: setGoalState } = useGoalState(
-    composerSessionId,
-    showGoalControl && runnerOnline === true,
-  );
-  // "@"-file-mention is scoped to the native coding-agent harnesses: their
-  // vendor CLIs run in the workspace and read an on-disk file from an
-  // attachment marker the executor already emits. In-process SDK sessions
-  // get no mention menu, so the workspace listing is never fetched for them
-  // (``enabled`` gate below). Codex's marker says "Attached file:" while the
-  // others say "Attached:" — see ``mentionMarkerFor``. ``sessionHarness`` is
-  // already read above for the status-tray harness label.
-  // Derive from the canonical native-agent registry (which folds reversed
-  // spellings like ``native-pi``) rather than a literal harness-string compare,
-  // so the composer's "@" entry point can't split-brain from the file viewer's
-  // "Attach to agent" gate (``canAttachToAgent``), which already uses it.
-  const mentionEnabled = nativeCodingAgentForHarness(sessionHarness) !== undefined;
+  const {
+    goal,
+    goalRevision,
+    setGoal: setGoalState,
+    refreshGoal,
+    refreshGoalAfterActivity,
+  } = useGoalState(composerSessionId, showGoalControl, runnerOnline === true);
+  useEffect(() => {
+    if (isWorking) refreshGoalAfterActivity();
+  }, [isWorking, refreshGoalAfterActivity]);
+  // "@"-file-mention is scoped to harnesses whose agent opens an on-disk file
+  // from the attachment marker (``harnessSupportsFileMentions``); others get no
+  // menu, so the workspace listing is never fetched for them. Codex's marker
+  // says "Attached file:" while the others say "Attached:" - see
+  // ``mentionMarkerFor``. FileViewer's "Attach to agent" gate uses the same helper.
+  const fileMentionHarnesses = useFileMentionHarnesses();
+  const mentionEnabled = harnessSupportsFileMentions(sessionHarness, fileMentionHarnesses);
   const workspaceFilesQuery = useWorkspaceAllFiles(composerSessionId ?? undefined, {
     enabled: mentionEnabled,
   });
@@ -3051,6 +3092,20 @@ function ComposerImpl(
     };
   }, [conversationId, replaceText]);
 
+  // A rewind can land here before its response brings the prompt back, and its
+  // attachments can follow the text; take each unless the user has started
+  // typing. The store already saved the draft, so taking it leaves it clean.
+  const rewindPrefill = useChatStore((s) => s.rewindPrefill);
+  useEffect(() => {
+    if (rewindPrefill === null || rewindPrefill.conversationId !== conversationId) return;
+    if (settledConversationId !== conversationId) return;
+    useChatStore.setState({ rewindPrefill: null });
+    if (dirtyRef.current || filesRef.current.length > 0) return;
+    if (valueRef.current !== "" && valueRef.current !== rewindPrefill.text) return;
+    replaceText(rewindPrefill.text, rewindPrefill.replyDraft);
+    attachmentsRef.current.replaceFiles(rewindPrefill.files);
+  }, [rewindPrefill, conversationId, settledConversationId, replaceText]);
+
   // An Arca send waits in the queue for the host, so typing reopens; other gates stay.
   const inputDisabled =
     ((disabled || (unreachable && !sendReconnectsArca)) && sendDisabledReason === null) ||
@@ -3083,7 +3138,7 @@ function ComposerImpl(
   const terminalPending = useChatStore((s) => s.terminalPending);
   const hostOnline = useSessionHostOnline(composerSessionId ?? undefined);
   const {
-    skills,
+    skills: discoveredSkills,
     skillsWarnings,
     skillsStatus,
     refetch: refreshSkills,
@@ -3122,7 +3177,14 @@ function ComposerImpl(
   // trigger native compaction. Other SDK harnesses don't support it yet.
   const showCompact = isNativeWrapper || sessionHarness === "claude-sdk";
   const composerServerInfo = useServerInfo();
+  const workflowsEnabled = isFeatureEnabled(composerServerInfo, "workflows");
+  const skills = useMemo(
+    () => filterWorkflowSkills(discoveredSkills, workflowsEnabled),
+    [discoveredSkills, workflowsEnabled],
+  );
   const showClear = composerOffersClear(sessionHarness, composerServerInfo);
+  const showRewind = composerOffersRewind(sessionHarness, composerServerInfo);
+  const [rewindPickerOpen, setRewindPickerOpen] = useState(false);
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
@@ -3133,10 +3195,67 @@ function ComposerImpl(
   // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
   const canStartSideChat = useCanStartSideChat(composerSessionId, permissionLevel);
   const showSide = supportsSideChat(sessionHarness, canStartSideChat);
-  const slashCommands = useMemo(
+  // "Run a workflow" opens a dialog that asks for the goal, or a saved workflow's
+  // details, and sends the workflow. The "+" menu offers it, and so does the
+  // Tasks tab's empty state, which reaches it through the registry below.
+  const canStartWorkflow = !isReadOnly && offersWorkflow(skills);
+  const savedWorkflows = useSavedWorkflows({ enabled: canStartWorkflow });
+  const [workflowDialogOpen, setWorkflowDialogOpen] = useState(false);
+  const [workflowDialogDescription, setWorkflowDialogDescription] = useState("");
+  const [savedWorkflowToRun, setSavedWorkflowToRun] = useState<SavedWorkflow | null>(null);
+  const openWorkflowDialog = useCallback(
+    (description = "", savedWorkflow: SavedWorkflow | null = null) => {
+      setWorkflowDialogDescription(description);
+      setSavedWorkflowToRun(savedWorkflow);
+      setWorkflowDialogOpen(true);
+    },
+    [],
+  );
+  // The Tasks tab's Save as workflow opens a dialog for the name, then asks the
+  // agent to save the plan.
+  const canSaveWorkflow = !isReadOnly && offersSaveWorkflow(skills);
+  const [saveWorkflowName, setSaveWorkflowName] = useState<string | null>(null);
+  useEffect(() => {
+    setWorkflowDialogOpen(false);
+    setSaveWorkflowName(null);
+  }, [conversationId]);
+  useEffect(() => {
+    if (!canStartWorkflow || composerSessionId === null) return;
+    return registerStartWorkflow(composerSessionId, () => openWorkflowDialog());
+  }, [canStartWorkflow, composerSessionId, openWorkflowDialog]);
+  useEffect(() => {
+    if (!canSaveWorkflow || composerSessionId === null) return;
+    return registerSaveWorkflow(composerSessionId, setSaveWorkflowName);
+  }, [canSaveWorkflow, composerSessionId]);
+  // A task's ⋯ menu in the Tasks tab asks the agent to run, continue or retry a task.
+  const taskActionRef = useRef<(action: TaskAction, taskName: string) => void>(() => undefined);
+  useEffect(() => {
+    if (isReadOnly || composerSessionId === null) return;
+    return registerTaskAction(composerSessionId, (action, taskName) =>
+      taskActionRef.current(action, taskName),
+    );
+  }, [isReadOnly, composerSessionId]);
+  // The Tasks tab's play button asks the agent to pick a stopped plan back up.
+  const continuePlanRef = useRef<(planName: string | null) => void>(() => undefined);
+  useEffect(() => {
+    if (isReadOnly || composerSessionId === null) return;
+    return registerContinuePlan(composerSessionId, (planName) => continuePlanRef.current(planName));
+  }, [isReadOnly, composerSessionId]);
+  // The Tasks tab knows whether work remains active in background tasks or other agents.
+  const stopRef = useRef<() => void>(() => undefined);
+  useEffect(() => {
+    if (isReadOnly || composerSessionId === null) return;
+    return registerStopWork(composerSessionId, () => stopRef.current());
+  }, [isReadOnly, composerSessionId]);
+  const showGoal =
+    composerSessionId !== null &&
+    (showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl);
+  // The built-ins this session offers; a gated-off one leaves a same-named
+  // custom command to run as a skill.
+  const offeredBuiltinCommands = useMemo(
     () =>
       buildSlashCommandMap(
-        skills,
+        [],
         showEffort,
         showModel,
         showCompact,
@@ -3147,9 +3266,10 @@ function ComposerImpl(
         composerSessionId !== null,
         showClear,
         showCodexApprovalMode,
+        showRewind,
+        showGoal,
       ),
     [
-      skills,
       showEffort,
       showModel,
       showCompact,
@@ -3160,7 +3280,28 @@ function ComposerImpl(
       composerSessionId,
       showClear,
       showCodexApprovalMode,
+      showRewind,
+      showGoal,
     ],
+  );
+  const goalBuiltinNames = useMemo(() => new Set(showGoal ? ["/goal"] : []), [showGoal]);
+  const commandSkills = useMemo(
+    () =>
+      showGoal && skillPrefix === "/"
+        ? skills.filter((skill) => skill.name.toLowerCase() !== "goal")
+        : skills,
+    [skills, showGoal, skillPrefix],
+  );
+  const skillCommands = useMemo(
+    () => buildSkillCommandMap(skills, skillPrefix),
+    [skills, skillPrefix],
+  );
+  const slashCommands = useMemo(
+    () => ({
+      ...offeredBuiltinCommands,
+      ...buildSkillCommandMap(commandSkills, skillPrefix),
+    }),
+    [offeredBuiltinCommands, commandSkills, skillPrefix],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
   // Skills always need an optional argument fill-in so the user can
@@ -3168,8 +3309,15 @@ function ComposerImpl(
   // existing fill/execute split.
   const slashCommandsWithArgs = useMemo(
     () =>
-      buildSlashCommandWithArgsSet(skills, showEffort, showModel, showBtw, showSide, skillPrefix),
-    [skills, showEffort, showModel, showBtw, showSide, skillPrefix],
+      buildSlashCommandWithArgsSet(
+        commandSkills,
+        showEffort,
+        showModel,
+        showBtw,
+        showSide,
+        skillPrefix,
+      ),
+    [commandSkills, showEffort, showModel, showBtw, showSide, skillPrefix],
   );
 
   // Suggest names until a space starts the arguments; exclude file paths.
@@ -3304,7 +3452,8 @@ function ComposerImpl(
     draft.quotes.length === 0 && findMentionTokens(draft.text, mentionTokens).length > 0;
   const mirrorActive = composerIsCommand || mentionTokensShown;
   useComposerMirrorAlignment(backdropRef, tailTextareaRef, mirrorActive);
-  const hasDraft = fullText.trim().length > 0 || files.length > 0 || hasMentions;
+  const hasDraft =
+    fullText.trim().length > 0 || files.length > 0 || hasMentions || localReviewComments.length > 0;
   const showInterruptButton =
     isWorking &&
     (!hasDraft ||
@@ -3444,6 +3593,13 @@ function ComposerImpl(
    */
   const executeSlashCommand = (cmd: string, arg: string): boolean => {
     switch (cmd) {
+      case "/goal": {
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        setGoalDialogOpen(true);
+        return true;
+      }
       case "/new": {
         if (arg) {
           setCommandError("/new does not accept arguments");
@@ -3473,6 +3629,21 @@ function ComposerImpl(
           .catch((err: unknown) => {
             setCommandError(err instanceof Error ? err.message : "Clear failed");
           });
+        return true;
+      }
+      case "/rewind": {
+        if (!showRewind || !composerSessionId) {
+          setCommandError("/rewind is not supported for this agent type");
+          return true;
+        }
+        if (arg) {
+          setCommandError("/rewind does not accept arguments");
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        setRewindPickerOpen(true);
         return true;
       }
       case "/compact": {
@@ -3689,13 +3860,6 @@ function ComposerImpl(
     }
   };
 
-  const skillCommands = useMemo(
-    () =>
-      Object.fromEntries(
-        skills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
-      ),
-    [skills, skillPrefix],
-  );
   const skillLabels = useMemo(() => skillDisplayNames(skills, skillPrefix), [skills, skillPrefix]);
   const selectedAgent = agents?.find((agent) => agent.id === boundAgentId);
   const registryEnabled =
@@ -3827,6 +3991,7 @@ function ComposerImpl(
     text: value,
     commands: slashCompletionCommands,
     skills: skillCommands,
+    builtinNames: goalBuiltinNames,
     labels: skillLabels,
     textareaRef,
     prefix: skillPrefix,
@@ -4024,7 +4189,7 @@ function ComposerImpl(
     const trimmed = fullText.trim();
     // Allow send if there's text, attached files, OR "@"-tagged paths.
     if (
-      (!trimmed && files.length === 0 && !hasMentions) ||
+      (!trimmed && files.length === 0 && !hasMentions && localReviewComments.length === 0) ||
       disabled ||
       sendDisabledReason !== null ||
       hasPendingElicitation
@@ -4065,11 +4230,13 @@ function ComposerImpl(
     const skill = onSendSlashCommand
       ? matchSlashCommandInvocation(trimmed, slashCommandNames)
       : null;
+    let goalMessage: string | null = null;
     if (
       draft.quotes.length === 0 &&
       (skill !== null || isSlashCommandText(trimmed)) &&
       files.length === 0 &&
-      !hasMentions
+      !hasMentions &&
+      localReviewComments.length === 0
     ) {
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0].toLowerCase();
@@ -4092,6 +4259,9 @@ function ComposerImpl(
       if (skill !== null && skill.command !== parts[0]) {
         runCommand(() => sendSkill(skill));
         return;
+      }
+      if (cmd === "/goal" && showGoal && arg) {
+        goalMessage = `/goal ${trimmed.slice(parts[0].length).trim()}`;
       }
       // Bare "/model" when the session has a switchable model (claude-native):
       // sent as plaintext it would open Claude's interactive selector inside the
@@ -4121,8 +4291,8 @@ function ComposerImpl(
       if (
         cmd !== "/btw" &&
         cmd !== "/side" &&
-        cmd in BUILTIN_SLASH_COMMANDS &&
-        cmd in slashCommands
+        !(cmd === "/goal" && arg) &&
+        cmd in offeredBuiltinCommands
       ) {
         runCommand(() =>
           executeSlashCommand(
@@ -4142,7 +4312,7 @@ function ComposerImpl(
       // Known skill on an in-process session: send a `slash_command` event so
       // the server resolves it. Native-terminal sessions have no
       // `onSendSlashCommand`; their vendor TUI loads the skill from plaintext.
-      if (skill !== null) {
+      if (skill !== null && !(cmd === "/goal" && showGoal)) {
         runCommand(() => sendSkill(skill));
         return;
       }
@@ -4153,6 +4323,12 @@ function ComposerImpl(
     // the harness's "[Attached: <path>]" wording (the vendor reads the on-disk
     // path; no upload), sessions as "[Session: …]". A tagged session also adds
     // one tool hint at the end.
+    const hasAuthoredText =
+      !!draft.text.trim() || draft.quotes.some((quote) => quote.before.trim());
+    const reviewContext =
+      localReviewComments.length > 0
+        ? formatLocalReviewComments(localReviewComments, { includeInstruction: !hasAuthoredText })
+        : "";
     const tagsSessions = liveMentions.some((m) => m.marker.startsWith("[Session: "));
     const expand = (text: string) => expandMentionTokens(text, liveMentions);
     // Sending while a prior response is streaming is fine — the
@@ -4163,22 +4339,95 @@ function ComposerImpl(
     const sendFiles = files.length > 0 ? files : undefined;
     if (draft.quotes.length > 0) {
       // Preserve authored whitespace and quote provenance, including mention markers.
-      const outgoing = {
-        ...draft,
-        text: withSessionMentionHint(expand(draft.text), tagsSessions),
-        quotes: draft.quotes.map((quote) => ({ ...quote, before: expand(quote.before) })),
-      };
+      const outgoing = appendReplyDraft(
+        {
+          ...draft,
+          text: expand(draft.text),
+          quotes: draft.quotes.map((quote) => ({ ...quote, before: expand(quote.before) })),
+        },
+        { quotes: [], text: reviewContext },
+      );
+      outgoing.text = withSessionMentionHint(outgoing.text, tagsSessions);
       onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
-      const message = isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
-      onSend(withSessionMentionHint(expand(message), tagsSessions), sendFiles);
+      const message = goalMessage ?? (isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd());
+      onSend(
+        withSessionMentionHint(
+          [expand(message), reviewContext].filter(Boolean).join("\n\n"),
+          tagsSessions,
+        ),
+        sendFiles,
+      );
+      if (goalMessage) refreshGoalAfterActivity();
     }
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
     clearAttachments();
     setMentionedItems([]);
     setMentionedSessions([]);
+    if (conversationId) clearLocalReviewContexts(conversationId);
     setMention(null);
+  };
+
+  // The workflow dialogs send straight to the chat and leave the draft alone.
+  const sendWorkflowMessage = (message: string) => {
+    const skill = onSendSlashCommand
+      ? matchSlashCommandInvocation(message, slashCommandNames)
+      : null;
+    setCommandError(null);
+    appendEntry(message);
+    if (skill !== null) onSendSlashCommand?.(skill.command.slice(1), skill.args);
+    else onSend(message);
+  };
+  const runWorkflow = (request: WorkflowRequest) =>
+    sendWorkflowMessage(
+      request.savedWorkflow
+        ? savedWorkflowMessage(
+            skillPrefix,
+            request.savedWorkflow,
+            request.description,
+            request.reviewPlanFirst,
+          )
+        : workflowMessage(skillPrefix, request.description, request.reviewPlanFirst),
+    );
+  const saveWorkflow = (name: string) =>
+    sendWorkflowMessage(saveWorkflowMessage(skillPrefix, name));
+  // Why a message from a dialog or the Tasks tab can't go out now, if it can't.
+  const blockedReasonFor = (action: string) =>
+    composerLockedByBtw
+      ? "Close the side question first."
+      : hasPendingElicitation
+        ? "Answer the agent's question first."
+        : unreachable
+          ? `The session is offline. Reconnect it to ${action}.`
+          : (sendDisabledReason ??
+            (disabled ? "This session can't take messages right now." : null));
+  const workflowBlockedReason = blockedReasonFor("run a workflow");
+  taskActionRef.current = (action, taskName) => {
+    const reason = blockedReasonFor(`${action === "proceed" ? "continue" : action} the task`);
+    if (reason) toast.error(reason);
+    else sendWorkflowMessage(taskActionMessage(action, taskName));
+  };
+  continuePlanRef.current = (planName) => {
+    const reason = blockedReasonFor("continue the plan");
+    if (reason) toast.error(reason);
+    else sendWorkflowMessage(continuePlanMessage(planName));
+  };
+  stopRef.current = () => {
+    const reason = blockedReasonFor("stop the workflow");
+    if (reason) toast.error(reason);
+    else if (conversationId) {
+      const message = stopPlanMessage(null);
+      appendEntry(message);
+      // Stop must reach the coordinator even while ordinary follow-ups are queued.
+      void sendUserMessage(conversationId, message)
+        .then((result) => {
+          if (result.denied) toast.error("A policy blocked the message.");
+        })
+        .catch((error: unknown) => {
+          toast.error(error instanceof Error ? error.message : "Couldn't reach the session.");
+        });
+    }
   };
 
   const handleSubmit = (e: FormEvent) => {
@@ -4215,7 +4464,8 @@ function ComposerImpl(
   };
 
   // An empty composer with no attachments or @-mentions; ↑ recalls from the queue here.
-  const composerEmptyForRecall = fullText === "" && files.length === 0 && !hasMentions;
+  const composerEmptyForRecall =
+    fullText === "" && files.length === 0 && !hasMentions && localReviewComments.length === 0;
   // The queued row ↑ recalls: the queue tail, only while the composer takes input and
   // is empty and quote-free.
   const arrowUpRecallQueueId =
@@ -4548,6 +4798,22 @@ function ComposerImpl(
             ) : undefined,
           beforeInput: (
             <>
+              {showRewind && composerSessionId && (
+                <RewindPicker
+                  sessionId={composerSessionId}
+                  open={rewindPickerOpen}
+                  onOpenChange={setRewindPickerOpen}
+                  onPick={(prompt) => {
+                    setRewindPickerOpen(false);
+                    void useChatStore
+                      .getState()
+                      .rewindToPrompt(prompt.itemId)
+                      .catch((err: unknown) => {
+                        setCommandError(err instanceof Error ? err.message : "Rewind failed");
+                      });
+                  }}
+                />
+              )}
               {/* Slash-command suggestions — floats above the composer box */}
               {slashCompletion.open && (
                 <SlashCommandMenu
@@ -4576,7 +4842,7 @@ function ComposerImpl(
                   mcpReconnectError={liveMcpReconnect.error}
                 />
               )}
-              {/* "@"-file-mention browser — native coding-agent sessions only.
+              {/* "@"-file-mention browser - sessions gated by ``mentionEnabled``.
             Also shown (as a loading row) while the listing is still fetching,
             so "@" isn't silently dead during runner cold-boot or a drill-in. */}
               {(mentionOpen || mentionListingPending) && (
@@ -4661,6 +4927,7 @@ function ComposerImpl(
               {attachmentError !== null && (
                 <ComposerFeedbackRow tone="error">{attachmentError}</ComposerFeedbackRow>
               )}
+              <ComposerLocalReviewChips comments={localReviewComments} />
               {/* Inline slash-command feedback: errors and /help output */}
               {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}
             </>
@@ -4710,6 +4977,13 @@ function ComposerImpl(
                       }
                     : undefined
                 }
+                onWorkflow={canStartWorkflow ? openWorkflowDialog : undefined}
+                savedWorkflows={savedWorkflows.workflows}
+                workflowPagination={savedWorkflows.pagination}
+                onRunSavedWorkflow={
+                  canStartWorkflow ? (workflow) => openWorkflowDialog("", workflow) : undefined
+                }
+                onOpen={savedWorkflows.refresh}
               />
               {!subAgentLabel && composerSessionId && (
                 <MobileHeaderControlPortal sessionId={composerSessionId}>
@@ -4863,7 +5137,9 @@ function ComposerImpl(
           conversationId={composerSessionId}
           readOnly={isReadOnly}
           goal={goal}
+          goalRevision={goalRevision}
           onGoalChange={setGoalState}
+          refreshGoal={refreshGoal}
         />
       ) : (
         (showClaudeGoalControl || showPollyCodexGoalControl) && (
@@ -4875,6 +5151,27 @@ function ComposerImpl(
             backendLabel={showClaudeGoalControl ? "Claude" : "Codex"}
           />
         )
+      )}
+      {canStartWorkflow && (
+        <WorkflowDialog
+          open={workflowDialogOpen}
+          onOpenChange={setWorkflowDialogOpen}
+          onRunWorkflow={runWorkflow}
+          initialDescription={workflowDialogDescription}
+          savedWorkflow={savedWorkflowToRun}
+          blockedReason={workflowBlockedReason}
+        />
+      )}
+      {canSaveWorkflow && (
+        <SaveWorkflowDialog
+          open={saveWorkflowName !== null}
+          onOpenChange={(open) => {
+            if (!open) setSaveWorkflowName(null);
+          }}
+          initialName={saveWorkflowName ?? ""}
+          onSave={saveWorkflow}
+          blockedReason={workflowBlockedReason}
+        />
       )}
       <ComposerStatusLine />
     </form>

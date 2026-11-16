@@ -30,7 +30,9 @@ from omnigent.tools.builtins import (
     SysCancelAsyncTool,
     SysListModelsTool,
     SysProjectListTool,
+    SysProjectUpdateTool,
     SysReadInboxTool,
+    SysReminderSetTool,
     SysScheduledTaskCreateTool,
     SysScheduledTaskDeleteTool,
     SysScheduledTaskListTool,
@@ -39,6 +41,7 @@ from omnigent.tools.builtins import (
     SysSessionCreateTool,
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
+    SysSessionLinkPrTool,
     SysSessionListTool,
     SysSessionRenameTool,
     SysSessionSendTool,
@@ -193,6 +196,7 @@ class ToolManager:
         self._register_comment_tools()
         self._register_policy_tools()
         self._register_scheduled_task_tools()
+        self._register_journal_tools()
         self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
@@ -217,10 +221,10 @@ class ToolManager:
         Auto-register the scheduled-task management builtins.
 
         Registered without spec opt-in so an agent can create, list,
-        update, and delete recurring scheduled tasks at runtime;
-        ``tool_groups.scheduled_tasks: false`` drops all four. The runner
-        dispatches them via the Omnigent server's ``/v1/scheduled-tasks``
-        REST endpoints.
+        update, and delete recurring scheduled tasks, and set one-time
+        reminders, at runtime; ``tool_groups.scheduled_tasks: false`` drops
+        all five. The runner dispatches them via the Omnigent server's
+        ``/v1/scheduled-tasks`` REST endpoints.
         """
         if not self._spec.tool_groups.scheduled_tasks:
             return
@@ -229,8 +233,24 @@ class ToolManager:
             SysScheduledTaskListTool(),
             SysScheduledTaskUpdateTool(),
             SysScheduledTaskDeleteTool(),
+            SysReminderSetTool(),
         ):
             self._tools[tool.name()] = tool
+
+    def _register_journal_tools(self) -> None:
+        """
+        Auto-register the ``sys_journal_*`` tools for the session's journal.
+
+        Registered without spec opt-in, so every agent can keep a plan, step
+        statuses and notes; ``tool_groups.journal: false`` drops all four. The
+        runner dispatches them via the server's ``/v1/sessions/{id}/journal``.
+        """
+        if not self._spec.tool_groups.journal:
+            return
+        from omnigent.tools.builtins.journal import JOURNAL_TOOLS
+
+        for tool_class in JOURNAL_TOOLS:
+            self._tools[tool_class.name()] = tool_class()
 
     def _register_async_inbox_tools(self) -> None:
         """
@@ -542,7 +562,7 @@ class ToolManager:
 
     def _register_project_tools(self) -> None:
         """
-        Register ``sys_project_list`` and ``sys_session_update``.
+        Register the project and session organizing tools.
 
         They proxy the owner-gated projects and session PATCH endpoints the
         sidebar uses, so they grant no access the caller lacks;
@@ -551,7 +571,9 @@ class ToolManager:
         if not self._spec.tool_groups.projects:
             return
         self._tools[SysProjectListTool.name()] = SysProjectListTool()
+        self._tools[SysSessionLinkPrTool.name()] = SysSessionLinkPrTool()
         self._tools[SysSessionUpdateTool.name()] = SysSessionUpdateTool()
+        self._tools[SysProjectUpdateTool.name()] = SysProjectUpdateTool()
 
     def _register_task_lifecycle_tools(self) -> None:
         """

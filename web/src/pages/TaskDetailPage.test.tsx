@@ -18,11 +18,13 @@ import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { TaskDetailPage } from "./TaskDetailPage";
 import {
   emptyTriggerFields,
+  encodeTriggerPrompt,
   renderTriggerPrompt,
-  splitTriggerPrompt,
 } from "@/components/scheduled/triggerTemplates";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import * as hooks from "@/hooks/useScheduledTasks";
+import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
+import type * as SidebarDataModule from "@/hooks/useSidebarData";
 import {
   markConversationSeen,
   markConversationUnread,
@@ -32,7 +34,13 @@ import {
 import type * as UnseenModule from "@/hooks/useUnseenConversations";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
 import type * as RoutingModule from "@/lib/routing";
-import type { ScheduledTask, ScheduledTaskRun } from "@/lib/scheduledTasksApi";
+import type * as SavedWorkflowsModule from "@/hooks/useSavedWorkflows";
+import type {
+  ScheduledTask,
+  ScheduledTaskRun,
+  ScheduledTaskRunSteps,
+} from "@/lib/scheduledTasksApi";
+import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
 
 const navigate = vi.fn();
 let routeParams = { taskId: "st_1" };
@@ -46,11 +54,33 @@ vi.mock("@/lib/routing", async (importOriginal) => {
 });
 
 vi.mock("@/hooks/useScheduledTasks", () => ({
+  scheduledTaskRunsKey: (id: string) => ["scheduled-task-runs", id],
   useScheduledTask: vi.fn(),
   useScheduledTaskRuns: vi.fn(),
+  useScheduledTaskRunSteps: vi.fn(() => new Map()),
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
+}));
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
+  ...(await importOriginal<typeof SidebarDataModule>()),
+  useOptionalLoadedConversations: vi.fn(),
+}));
+// The graph has its own tests (React Flow runs out of memory in jsdom); here the
+// full-screen view lists where each task stands.
+vi.mock("@/components/workflows/WorkflowStepsGraph", () => ({
+  WorkflowGraphOverlay: (props: {
+    title: string;
+    progress?: { step: { id: string }; state: string }[];
+    onClose: () => void;
+  }) => (
+    <div data-testid="workflow-graph-overlay" data-title={props.title}>
+      {props.progress?.map((item) => `${item.step.id}:${item.state}`).join(" ")}
+      <button type="button" onClick={props.onClose}>
+        Close graph
+      </button>
+    </div>
+  ),
 }));
 
 const showToast = vi.fn();
@@ -97,6 +127,16 @@ vi.mock("@/hooks/useUnseenConversations", async (importOriginal) => {
 // Freeze the ticking clock so relative next-run text is deterministic.
 vi.mock("@/hooks/useNow", () => ({
   useNow: () => new Date("2026-07-27T12:00:00Z"),
+}));
+// A run's workflow button names its workflow from the saved ones.
+vi.mock("@/hooks/useSavedWorkflows", async (importOriginal) => ({
+  ...(await importOriginal<typeof SavedWorkflowsModule>()),
+  useSavedWorkflows: () => ({
+    workflows: [{ id: "9".repeat(32), name: "Triage", description: "" }],
+    isLoading: false,
+    isError: false,
+    refresh: () => undefined,
+  }),
 }));
 
 // Stub the edit dialog to a marker that reports open + the task it edits.
@@ -159,6 +199,7 @@ function run(overrides: Partial<ScheduledTaskRun> = {}): ScheduledTaskRun {
     firedAt: 1_700_000_000,
     finishedAt: 1_700_000_102,
     errorCode: null,
+    errorDetail: null,
     conversationUpdatedAt: 1_700_000_500,
     conversationStatus: "idle",
     viewerLastSeen: null,
@@ -200,6 +241,7 @@ function setRuns(
 
 beforeEach(() => {
   routeParams = { taskId: "st_1" };
+  vi.mocked(useOptionalLoadedConversations).mockReturnValue(undefined);
   useAvailableAgents.mockImplementation(defaultAgentCatalog);
   navigate.mockReset();
   updateMutate.mockReset();
@@ -262,28 +304,73 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-prompt")).toHaveTextContent("None");
   });
 
-  it("shows the user prompt first and keeps generated instructions collapsed and read-only", () => {
-    const prompt = renderTriggerPrompt(
-      "slack",
-      { ...emptyTriggerFields("slack"), scope: "abc", instructions: "Summarize new messages." },
-      { placement: "same_host", sessionLink: "https://example.test/c/CONVERSATION_ID" },
-    );
-    setTask(task({ prompt }));
-    renderPage();
-    expect(screen.getByRole("heading", { name: "Your prompt" })).toBeVisible();
-    expect(screen.getByTestId("task-detail-prompt").textContent).toBe("Summarize new messages.");
-    const toggle = screen.getByRole("button", { name: "System prompt" });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByTestId("task-detail-system-prompt")).not.toBeInTheDocument();
+  it.each([false, true])(
+    "shows only a trigger's instructions, never its template text (header: %s)",
+    (withHeader) => {
+      const fields = {
+        ...emptyTriggerFields("slack"),
+        scope: "abc",
+        instructions: "Summarize new messages.",
+      };
+      const sessionLink = "https://example.test/c/CONVERSATION_ID";
+      const prompt = withHeader
+        ? encodeTriggerPrompt(
+            {
+              source: "slack",
+              ...fields,
+              worker: {
+                placement: "same_host",
+                agentId: null,
+                model: "",
+                effort: "",
+                permissionMode: "",
+              },
+            },
+            { sessionLink },
+          )
+        : renderTriggerPrompt("slack", fields, { placement: "same_host", sessionLink });
+      setTask(task({ prompt, sessionMode: "continue" }));
+      renderPage();
+      expect(screen.getByRole("heading", { name: "Instructions" })).toBeVisible();
+      expect(screen.getByTestId("task-detail-prompt").textContent).toBe("Summarize new messages.");
+      expect(screen.queryByRole("button", { name: "System prompt" })).not.toBeInTheDocument();
+      expect(screen.queryByText(/This automation watches Slack/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/omnigent-trigger/)).not.toBeInTheDocument();
+    },
+  );
 
-    fireEvent.click(toggle);
-    expect(screen.getByTestId("task-detail-system-prompt").textContent).toBe(
-      splitTriggerPrompt(prompt).systemPrompt,
+  it.each([
+    [
+      "edited outside the form",
+      "continue",
+      (prompt: string) => prompt.replace("Summarize new messages.", "Do nothing."),
+    ],
+    ["on a task that starts new sessions", "new", (prompt: string) => prompt],
+  ] as const)("shows the full prompt for a header %s", (_case, sessionMode, mutate) => {
+    const prompt = mutate(
+      encodeTriggerPrompt(
+        {
+          source: "slack",
+          ...emptyTriggerFields("slack"),
+          scope: "abc",
+          instructions: "Summarize new messages.",
+          worker: {
+            placement: "same_host",
+            agentId: null,
+            model: "",
+            effort: "",
+            permissionMode: "",
+          },
+        },
+        { sessionLink: "https://example.test/c/CONVERSATION_ID" },
+      ),
     );
-    expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
-    fireEvent.click(toggle);
-    expect(screen.queryByTestId("task-detail-system-prompt")).not.toBeInTheDocument();
-    expect(screen.getByTestId("task-detail-prompt")).toBeVisible();
+    setTask(task({ prompt, sessionMode }));
+    renderPage();
+    expect(screen.getByRole("heading", { name: "Prompt" })).toBeVisible();
+    const shown = screen.getByTestId("task-detail-prompt").textContent ?? "";
+    expect(shown).toContain("This automation watches Slack");
+    expect(shown).not.toContain("omnigent-trigger");
   });
 
   it("starts with configuration collapsed and toggles it while keeping run history visible", () => {
@@ -1024,6 +1111,28 @@ describe("run history", () => {
     expect(within(row).getByTestId("run-failure")).toHaveTextContent(
       "Runner · The agent didn't start.",
     );
+    // A run that recorded no failure detail shows no detail line.
+    expect(within(row).queryByTestId("run-failure-detail")).toBeNull();
+  });
+
+  it("shows a failed run's detail under its reason", () => {
+    setTask(task());
+    setRuns([
+      run({
+        status: "failed",
+        errorCode: "sandbox_registration_timeout",
+        errorDetail: "the sandbox did not register within 720 seconds — refresh your credentials",
+        conversationId: "c_7",
+      }),
+    ]);
+    renderPage();
+    const row = screen.getByTestId("task-detail-run");
+    expect(within(row).getByTestId("run-failure")).toHaveTextContent(
+      "Sandbox · The sandbox didn't connect in time.",
+    );
+    expect(within(row).getByTestId("run-failure-detail")).toHaveTextContent(
+      "the sandbox did not register within 720 seconds — refresh your credentials",
+    );
   });
 
   it("labels a run that hasn't started yet as Queued", () => {
@@ -1319,3 +1428,276 @@ it.each(["continue", "new"] as const)(
     }
   },
 );
+
+describe("runs of a saved workflow", () => {
+  const WORKFLOW_PROMPT = `/workflow Run the saved workflow "Triage" (ID ${"9".repeat(32)}).`;
+  const STEPS: ScheduledTaskRunSteps = {
+    runId: "run_1",
+    planId: "plan_1",
+    isCurrent: true,
+    workflowId: "9".repeat(32),
+    planName: "Triage",
+    steps: [
+      { id: "explore", name: "Explore", goal: null, depends_on: [] },
+      { id: "fix", name: "Fix", goal: null, depends_on: ["explore"] },
+    ],
+    statuses: [
+      {
+        id: "s1",
+        position: 1,
+        created_at: 1_700_000_100,
+        scheduled_task_run_id: "run_1",
+        step: "explore",
+        author: { type: "agent" },
+        kind: "status",
+        content: { status: "done", text: "Found it" },
+      },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map());
+  });
+
+  it.each([false, true])("shows each run's tasks and graph (trigger header=%s)", (header) => {
+    const prompt = header
+      ? encodeTriggerPrompt(
+          {
+            ...emptyTriggerFields("github"),
+            source: "github",
+            scope: "example/project",
+            instructions: WORKFLOW_PROMPT,
+            worker: {
+              placement: "same_host",
+              agentId: null,
+              model: "",
+              effort: "",
+              permissionMode: "",
+            },
+          },
+          { sessionLink: "https://example.test/c/CONVERSATION_ID" },
+        )
+      : WORKFLOW_PROMPT;
+    setTask(task({ prompt }));
+    const completedRun = run({ id: "run_1", status: "succeeded", conversationId: "c_9" });
+    setRuns([completedRun]);
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", STEPS]]));
+    const renderWorkflowPage = () => (
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>
+    );
+    const { rerender } = render(renderWorkflowPage());
+
+    expect(screen.getByRole("heading", { name: "Runs" })).toBeInTheDocument();
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      true,
+    );
+    const row = screen.getByTestId("task-detail-run");
+    // The row still opens its session.
+    expect(within(row).getByTestId("run-open")).toHaveAttribute("href", "/c/c_9");
+    const segments = within(row).getAllByTestId("tasks-progress-segment");
+    expect(segments.map((segment) => segment.getAttribute("aria-label"))).toEqual([
+      "Task 1, Explore: Done",
+      "Task 2, Fix: Ready",
+    ]);
+    // Its session went idle with Fix still to do, so the row can continue the plan.
+    expect(within(row).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
+
+    fireEvent.click(within(row).getByTestId("run-graph-button"));
+    const overlay = screen.getByTestId("workflow-graph-overlay");
+    expect(overlay).toHaveAttribute("data-title", "Triage");
+    expect(overlay).toHaveTextContent("explore:done fix:ready");
+    fireEvent.click(within(overlay).getByRole("button", { name: "Close graph" }));
+    expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
+
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([
+        [
+          "run_1",
+          {
+            ...STEPS,
+            statuses: [
+              ...STEPS.statuses,
+              {
+                ...STEPS.statuses[0]!,
+                id: "s2",
+                position: 2,
+                step: "fix",
+                content: { status: "started", text: "Working" },
+              },
+            ],
+          },
+        ],
+      ]),
+    );
+    for (const activity of [{ background_work_running: true }, { status: "running" as const }]) {
+      setRuns([completedRun]);
+      vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+        ...conversationPage([conversation("c_9", activity)]).data!,
+        pageParams: [undefined],
+      });
+      rerender(renderWorkflowPage());
+      expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+      expect(within(row).getAllByTestId("tasks-progress-segment")[1]).toHaveAttribute(
+        "aria-label",
+        "Task 2, Fix: Running",
+      );
+      fireEvent.click(within(row).getByTestId("run-graph-button"));
+      expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent("fix:running");
+
+      // The sidebar settles before the next run-list refresh.
+      setRuns([{ ...completedRun, conversationStatus: "running" }]);
+      vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+        ...conversationPage([conversation("c_9")]).data!,
+        pageParams: [undefined],
+      });
+      rerender(renderWorkflowPage());
+      expect(within(row).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
+      expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent("fix:stopped");
+      fireEvent.click(screen.getByRole("button", { name: "Close graph" }));
+    }
+  });
+
+  it.each([false, true])(
+    "keeps earlier continuations read-only (completed=%s)",
+    async (completed) => {
+      setTask(task({ prompt: WORKFLOW_PROMPT }));
+      setRuns([
+        run({
+          id: "run_1",
+          status: "succeeded",
+          conversationId: "c_9",
+          conversationStatus: "running",
+        }),
+        run({
+          id: "run_2",
+          status: "running",
+          conversationId: "c_9",
+          conversationStatus: "running",
+        }),
+      ]);
+      const historical = {
+        ...STEPS,
+        isCurrent: false,
+        statuses: completed
+          ? [...STEPS.statuses, { ...STEPS.statuses[0]!, id: "s2", step: "fix" }]
+          : [{ ...STEPS.statuses[0]!, content: { status: "started", text: "Working" } }],
+      };
+      vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+        new Map([
+          ["run_1", historical],
+          ["run_2", { ...STEPS, runId: "run_2" }],
+        ]),
+      );
+      vi.mocked(useOptionalLoadedConversations).mockReturnValue({
+        ...conversationPage([conversation("c_9", { background_work_running: true })]).data!,
+        pageParams: [undefined],
+      });
+      render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
+        >
+          {pageTree()}
+        </CapabilitiesProvider>,
+      );
+      const [old, current] = screen.getAllByTestId("task-detail-run");
+      expect(within(old!).queryByTestId("plan-stop")).toBeNull();
+      expect(within(old!).queryByTestId("plan-continue")).toBeNull();
+      expect(within(old!).queryByTestId("run-status-label")).toBeNull();
+      expect(within(current!).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+      fireEvent.focus(within(old!).getAllByTestId("tasks-progress-segment")[0]!);
+      expect(await screen.findByTestId("tasks-progress-card")).toHaveTextContent("Explore");
+      expect(screen.queryByTestId("tasks-progress-menu")).toBeNull();
+      fireEvent.click(within(old!).getByTestId("run-graph-button"));
+      expect(screen.getByTestId("workflow-graph-overlay")).toHaveTextContent(
+        `explore:${completed ? "done" : "stopped"}`,
+      );
+    },
+  );
+
+  it("opens the run's workflow left of the graph button, with the Workflows page on", () => {
+    setTask(task({ prompt: WORKFLOW_PROMPT }));
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    const renderRun = (steps: ScheduledTaskRunSteps, workflowsPage: boolean) => {
+      vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", steps]]));
+      return render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: workflowsPage } }}
+        >
+          {pageTree()}
+        </CapabilitiesProvider>,
+      );
+    };
+
+    renderRun(STEPS, true);
+    const row = screen.getByTestId("task-detail-run");
+    const link = within(row).getByRole("link", { name: "Open workflow “Triage”" });
+    expect(link).toHaveAttribute("href", `/workflows/${"9".repeat(32)}`);
+    expect(link.nextElementSibling).toBe(within(row).getByTestId("run-graph-button"));
+    cleanup();
+
+    // Not without the Workflows page, nor for a run whose plan names no workflow.
+    renderRun(STEPS, false);
+    expect(screen.queryByTestId("run-graph-button")).toBeNull();
+    expect(screen.queryByTestId("run-workflow-button")).toBeNull();
+    expect(screen.queryByTestId("tasks-progress-segment")).toBeNull();
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      false,
+    );
+    cleanup();
+    renderRun({ ...STEPS, workflowId: null }, true);
+    expect(screen.getByTestId("run-graph-button")).toBeInTheDocument();
+    expect(screen.queryByTestId("run-workflow-button")).toBeNull();
+  });
+
+  it("asks for no plans when the server disables workflows", () => {
+    setTask(task());
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    renderPage();
+
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      false,
+    );
+    expect(screen.queryByTestId("tasks-progress-segment")).toBeNull();
+    expect(screen.queryByTestId("run-graph-button")).toBeNull();
+  });
+
+  it.each([
+    "Summarize the new issues.",
+    `/workflow Run the saved workflow "Weekly report" (ID ${"8".repeat(32)}).`,
+  ])("keeps recorded workflow history after editing the prompt to %s", (prompt) => {
+    setTask(task({ prompt }));
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", STEPS]]));
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
+
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      true,
+    );
+    const row = screen.getByTestId("task-detail-run");
+    expect(within(row).getAllByTestId("tasks-progress-segment")).toHaveLength(2);
+    expect(within(row).getByRole("link", { name: "Open workflow “Triage”" })).toHaveAttribute(
+      "href",
+      `/workflows/${"9".repeat(32)}`,
+    );
+    fireEvent.click(within(row).getByTestId("run-graph-button"));
+    expect(screen.getByTestId("workflow-graph-overlay")).toHaveAttribute("data-title", "Triage");
+  });
+});

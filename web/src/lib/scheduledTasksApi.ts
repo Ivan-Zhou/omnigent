@@ -10,6 +10,7 @@
 // at fire time. Sandbox tasks instead accept a repository URL as workspace.
 
 import { authenticatedFetch } from "./identity";
+import type { JournalEntry, JournalPlanStep } from "./sessionJournal";
 import { startTimedInteraction } from "./analyticsEmit";
 
 export const RANDOM_WORKTREE_BASE_REF = "HEAD";
@@ -112,6 +113,11 @@ export interface ScheduledTaskRun {
   finishedAt: number | null;
   /** Queryable failure classification, e.g. `no_online_host`; `null` on success. */
   errorCode: string | null;
+  /**
+   * The server's description of the failure, e.g. a sandbox provider's recovery
+   * steps, capped server-side; `null` when the run recorded none.
+   */
+  errorDetail: string | null;
   /** Epoch seconds of the conversation's last update; `null` for runs without a conversation. */
   conversationUpdatedAt: number | null;
   /**
@@ -263,6 +269,7 @@ interface ScheduledTaskRunWire {
   fired_at: number | null;
   finished_at: number | null;
   error_code: string | null;
+  error_detail?: string | null;
   conversation_updated_at: number | null;
   conversation_status: string | null;
   viewer_last_seen: number | null;
@@ -351,6 +358,7 @@ function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
     firedAt: wire.fired_at,
     finishedAt: wire.finished_at,
     errorCode: wire.error_code,
+    errorDetail: wire.error_detail ?? null,
     conversationUpdatedAt: wire.conversation_updated_at ?? null,
     conversationStatus: wire.conversation_status ?? null,
     viewerLastSeen: wire.viewer_last_seen ?? null,
@@ -376,6 +384,55 @@ export async function listScheduledTaskRuns(id: string): Promise<ScheduledTaskRu
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}/runs`);
   const body = await readJsonOrThrow<{ runs: ScheduledTaskRunWire[] }>(res);
   return (body.runs ?? []).map(runFromWire);
+}
+
+/** The plan a run started with: its steps and each step's newest status. */
+export interface ScheduledTaskRunSteps {
+  runId: string;
+  planId: string | null;
+  isCurrent: boolean;
+  /** The saved workflow the plan runs, when it named one. */
+  workflowId: string | null;
+  planName: string | null;
+  steps: JournalPlanStep[];
+  statuses: JournalEntry[];
+}
+
+/**
+ * The plan steps of one page of a task's runs, most recent first, paged like
+ * {@link listScheduledTaskRuns}. Runs that wrote no plan are left out.
+ *
+ * @param after - The ID of the run before the page, e.g. the previous page's last.
+ */
+export async function listScheduledTaskRunSteps(
+  id: string,
+  { limit, after }: { limit: number; after?: string },
+): Promise<ScheduledTaskRunSteps[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (after) params.set("after", after);
+  const res = await authenticatedFetch(
+    `/v1/scheduled-tasks/${encodeURIComponent(id)}/run-steps?${params}`,
+  );
+  const body = await readJsonOrThrow<{
+    runs?: {
+      run_id: string;
+      plan_id?: string;
+      is_current?: boolean;
+      workflow_id: string | null;
+      plan_name?: string | null;
+      steps: JournalPlanStep[];
+      statuses: JournalEntry[];
+    }[];
+  }>(res);
+  return (body.runs ?? []).map((run) => ({
+    runId: run.run_id,
+    planId: run.plan_id ?? null,
+    isCurrent: run.is_current === true,
+    workflowId: run.workflow_id,
+    planName: run.plan_name ?? null,
+    steps: run.steps,
+    statuses: run.statuses,
+  }));
 }
 
 /**
