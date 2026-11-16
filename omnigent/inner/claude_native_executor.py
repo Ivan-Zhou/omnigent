@@ -15,7 +15,6 @@ from pathlib import Path
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
-    EFFORT_DIALOG_HINT,
     MANAGED_SANDBOX_SIGN_IN_REMEDY,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
@@ -63,7 +62,6 @@ from omnigent.inner.native_attachments import (
     framework_notices,
 )
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
-from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 _logger = logging.getLogger(__name__)
 
@@ -146,8 +144,6 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` when the model actually changes. Seeded lazily from the
         # spawn ``launch_model`` on the first turn (``None`` = not yet known).
         self._applied_model: str | None = None
-        # Avoid reissuing the cache-invalidating effort command every turn.
-        self._applied_effort: str | None = None
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` because output is emitted by the transcript forwarder."""
@@ -197,9 +193,8 @@ class ClaudeNativeExecutor(Executor):
         notices: list[str],
         wanted_model: str | None,
         wanted_model_arg: str | None,
-        wanted_effort: str | None = None,
     ) -> None:
-        """Apply routed ``/model`` / ``/effort`` switches, then inject the message, in one lock hold."""
+        """Apply a routed ``/model`` switch, then inject the message, in one lock hold."""
         async with self._inject_lock:
             self._require_active_session()
             context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
@@ -222,23 +217,6 @@ class ClaudeNativeExecutor(Executor):
                 # Track the routed id, not the alias: the next turn's
                 # comparison is against what routing asked for.
                 self._applied_model = wanted_model
-            if wanted_effort is not None and wanted_effort != self._applied_effort:
-                # Same serialization as ``/model``: an effort switch
-                # invalidates the prompt cache on a session with history, so
-                # Claude Code asks to confirm; the chat UI cannot render that
-                # TUI dialog, so answer it by its own title. Applied before the
-                # message under the same lock so its dialog can't race the
-                # inject below.
-                await self._inject(
-                    partial(
-                        inject_slash_command,
-                        self._bridge_dir,
-                        command=f"/effort {wanted_effort}",
-                        auto_confirm=True,
-                        confirm_hint=EFFORT_DIALOG_HINT,
-                    )
-                )
-                self._applied_effort = wanted_effort
             await self._inject_prompt(text, notices)
 
     async def _hold_message(self, refusal: RuntimeError, deadline: float) -> bool:
@@ -409,10 +387,11 @@ class ClaudeNativeExecutor(Executor):
             ``omnigent.runner.native.orchestration`` and
             ``omnigent.harnesses.claude_native.main``) — not per-turn through this
             parameter.
-        :param config: Per-turn executor config. A routed model arrives in
-            ``config.model`` and the session effort in
-            ``config.extra["reasoning_effort"]``. Both are applied inline,
-            before the message.
+        :param config: Per-turn executor config. Only ``config.model``
+            is used: when intelligent routing picks a model for this turn,
+            it arrives here (adapter maps ``request.model_override`` →
+            ``config.model``) and the switch is applied inline, before the
+            message — see the ``/model`` handling below.
         :yields: :class:`TurnComplete` after the input was injected,
             or :class:`ExecutorError` on bridge failure. A question,
             permission prompt or terminal dialog that refuses the message
@@ -471,10 +450,6 @@ class ClaudeNativeExecutor(Executor):
         # box and verifies its submit) delivers the message — in order,
         # once.
         wanted_model = config.model if config is not None else None
-        raw_effort = config.extra.get("reasoning_effort") if config is not None else None
-        wanted_effort = (
-            raw_effort if isinstance(raw_effort, str) and raw_effort in CLAUDE_EFFORTS else None
-        )
         # ``/model`` only accepts this session's picker values, aliases, and
         # custom slot; anything else is ignored and the pane keeps its model.
         wanted_model_arg = self._model_command_arg(wanted_model)
@@ -483,9 +458,7 @@ class ClaudeNativeExecutor(Executor):
                 hold_deadline: float | None = None
                 while True:
                     try:
-                        await self._inject_turn(
-                            text, notices, wanted_model, wanted_model_arg, wanted_effort
-                        )
+                        await self._inject_turn(text, notices, wanted_model, wanted_model_arg)
                         break
                     except (
                         ClaudeUserPromptPending,

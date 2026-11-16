@@ -128,14 +128,20 @@ async def test_events_effort_change_on_native_session_skips_inject_for_unsupport
 
 
 @pytest.mark.asyncio
-async def test_events_effort_change_on_native_session_does_not_require_ready_bridge(
+@pytest.mark.parametrize("error_type", [RuntimeError, OSError])
+async def test_events_effort_change_on_native_session_returns_503_when_bridge_not_ready(
     monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
 ) -> None:
     """
-    Effort persistence succeeds even when the Claude pane is not ready.
+    A bridge-not-ready RuntimeError or a tmux OSError surfaces as 503 from /events.
 
-    The executor applies the remembered effort with the next message, so the
-    control event must not touch tmux or fail while a new terminal is booting.
+    Sister to the happy-path test. Pins that the failure mode of the
+    native effort dispatch (tmux pane gone / bridge dir not yet
+    advertised) returns 503 with the same error code shape the
+    legacy route returns. Omnigent server's PATCH swallows this 503 and
+    still returns 200 with the persisted value — the next spawn
+    will apply the new effort via ``--effort``.
     """
 
     def _fake_inject(
@@ -147,9 +153,9 @@ async def test_events_effort_change_on_native_session_does_not_require_ready_bri
         confirm_hint: str | None = None,
         ready_timeout_s: float | None = None,
     ) -> None:
-        """Fail if the control event tries to reach the booting pane."""
-        del bridge_dir, command, timeout_s, auto_confirm, confirm_hint
-        raise AssertionError("effort_change must not inject before the next turn")
+        """Simulate the bridge-not-ready path."""
+        del bridge_dir, command, timeout_s
+        raise error_type("tmux target is not advertised")
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
@@ -172,9 +178,15 @@ async def test_events_effort_change_on_native_session_does_not_require_ready_bri
             json={"type": "effort_change", "effort": "high"},
         )
 
-    assert resp.status_code == 204, (
-        f"Native effort_change must not depend on pane readiness; "
+    assert resp.status_code == 503, (
+        f"Native effort_change with inject failure must return 503; "
         f"got {resp.status_code}: {resp.text}"
+    )
+    body = resp.json()
+    # ``claude_native_effort_failed`` is the same error code the
+    # legacy route uses — keeps the failure shape stable for callers.
+    assert body.get("error") == "claude_native_effort_failed", (
+        f"503 body must carry the bridge-failure error code; got {body!r}"
     )
 
 
@@ -1697,11 +1709,10 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
     inject_attr: str,
 ) -> None:
     """
-    Native model dispatch must call
+    Native effort / model dispatch must call
     ``_claude_native_bridge_id_for_session`` to resolve the
     bridge_id, not pass conv_id straight to
-    ``bridge_dir_for_conversation_id``. Effort dispatch is deliberately
-    excluded from the lookup because it defers /effort to the next turn.
+    ``bridge_dir_for_conversation_id``.
 
     Regression test for the bug that forced a revert. The
     handlers used ``bridge_dir_for_conversation_id(conv_id)``
@@ -1757,18 +1768,12 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
             json=event_payload,
         )
 
-    # Both native handlers return 204. The effort handler intentionally does
-    # not resolve a bridge or inject anything because it defers to the turn.
+    # The dispatch ran the native handler (inject was called via the
+    # fake, which doesn't raise) and returned 204.
     assert resp.status_code == 204, (
         f"Native dispatch for {event_payload['type']!r} must return "
         f"204; got {resp.status_code}: {resp.text}"
     )
-    if event_payload["type"] == "effort_change":
-        assert captured_bridge_dir == [], (
-            "effort_change must defer /effort to the executor turn without "
-            f"resolving a bridge; got {captured_bridge_dir!r}"
-        )
-        return
     # Exactly one inject call, with the bridge_dir derived from the
     # sentinel bridge_id — NOT from the conv_id.
     assert len(captured_bridge_dir) == 1, (
@@ -3042,22 +3047,19 @@ async def test_events_model_change_fails_and_logs_when_the_prompt_never_renders(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "event",
-    [{"type": "compact"}],
-    ids=["compact"],
+    [{"type": "effort_change", "effort": "high"}, {"type": "compact"}],
+    ids=["effort_change", "compact"],
 )
 async def test_events_settings_controls_cap_their_prompt_wait(
     monkeypatch: pytest.MonkeyPatch,
     event: dict[str, Any],
 ) -> None:
-    """Injected controls stop waiting for a booting prompt inside the server's budget.
+    """Effort and compact stop waiting for a booting prompt inside the server's budget.
 
     Uncapped, a live-but-booting pane earns the slow-boot extension (up to
     180s), far past the ~20s the server waits for these controls. The whole
     injection also stops sending keys once that budget is spent, so a slow
     submit or dialog cannot apply the control after the server reported it failed.
-    ``effort_change`` is not parametrized here: it defers ``/effort`` to the
-    executor's next turn and never injects (pinned by
-    ``test_events_effort_change_on_native_session_does_not_require_ready_bridge``).
     """
     caps: list[float | None] = []
     key_deadlines: list[float | None] = []

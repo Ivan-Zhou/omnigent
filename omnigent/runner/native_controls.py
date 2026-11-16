@@ -1311,16 +1311,47 @@ def build_native_controls(
         conv_id: str,
         effort: str | None,
     ) -> Response:
+        from omnigent.harnesses.claude_native.bridge import (
+            EFFORT_DIALOG_HINT,
+            bridge_dir_for_bridge_id,
+            inject_slash_command,
+        )
         from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
-        del conv_id
         if effort is None or effort not in CLAUDE_EFFORTS:
             return Response(status_code=204)
-        # This process cannot share the harness executor's injection lock, so
-        # injecting ``/effort`` here would race the executor's keystrokes on the
-        # same tmux pane. The effort was already remembered on
-        # ``_session_reasoning_effort``; it rides on the next turn's body (see
-        # ``_turn_reasoning``) and the executor applies it under its own lock.
+        deadline = _ClaudeControlDeadline()
+        bridge_id = await _claude_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
+        command = f"/effort {effort}"
+        try:
+            # An effort switch invalidates the prompt cache on a session with
+            # history, so Claude Code asks to confirm; the chat UI cannot render
+            # that TUI dialog, so answer it by its own title.
+            await _drive_claude_pane(
+                deadline,
+                inject_slash_command,
+                bridge_dir,
+                command=command,
+                timeout_s=1.0,
+                ready_timeout_s=min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()),
+                auto_confirm=True,
+                confirm_hint=EFFORT_DIALOG_HINT,
+            )
+        except (RuntimeError, ValueError, OSError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_effort_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="claude-native effort change"
+                    ),
+                },
+            )
         return Response(status_code=204)
 
     async def _watch_late_model_dialog(
