@@ -1804,6 +1804,7 @@ def run_claude_native(
     use_claude_config: bool = False,
     auto_open_conversation: bool = False,
     startup_profiler: StartupProfiler | None = None,
+    model: str | None = None,
 ) -> None:
     """
     Launch Claude Code in an Omnigent terminal and attach locally.
@@ -1853,6 +1854,8 @@ def run_claude_native(
     _preflight_local_tools(resolved_command)
     startup_profiler.mark("local tools ready")
     sanitized_args = _strip_resume_from_claude_args(claude_args)
+    launch_model = None if _claude_args_have_model(sanitized_args) else model
+    launch_args = _merge_default_model_arg(sanitized_args, model=launch_model)
     prompt = prompt if prompt and prompt.strip() else None
     startup_profiler.mark("claude args normalized")
     # Resolve the launch config across all offerings: a configured provider
@@ -1862,6 +1865,8 @@ def run_claude_native(
     # CLI's own ~/.claude config (skips all of it).
     startup_profiler.mark("resolving claude config")
     claude_config = None if use_claude_config else resolve_native_claude_config(spec=None)
+    if launch_model is not None and claude_config is not None:
+        claude_config = replace(claude_config, model=launch_model)
     startup_profiler.mark(
         "claude config resolved",
         detail="native config" if claude_config is not None else "claude cli config",
@@ -1872,7 +1877,7 @@ def run_claude_native(
         startup_profiler.mark("agent spec materialized")
         if server is None:
             # Keep the one-shot local prompt ahead of variadic flag values.
-            local_args = (prompt, *sanitized_args) if prompt is not None else sanitized_args
+            local_args = (prompt, *launch_args) if prompt is not None else launch_args
             _run_with_local_server(
                 spec_path,
                 session_id=session_id,
@@ -1880,6 +1885,7 @@ def run_claude_native(
                 claude_args=local_args,
                 command=resolved_command,
                 claude_config=claude_config,
+                model=launch_model,
                 auto_open_conversation=auto_open_conversation,
                 startup_profiler=startup_profiler,
             )
@@ -1892,7 +1898,8 @@ def run_claude_native(
                 spec_path,
                 session_id=session_id,
                 resume_picker=resume_picker,
-                claude_args=sanitized_args,
+                claude_args=launch_args,
+                model=launch_model,
                 prompt=prompt,
                 auto_open_conversation=auto_open_conversation,
                 startup_profiler=startup_profiler,
@@ -3983,6 +3990,7 @@ def _run_with_local_server(
     claude_args: tuple[str, ...],
     command: str,
     claude_config: ClaudeNativeUcodeConfig | None = None,
+    model: str | None = None,
     auto_open_conversation: bool = False,
     startup_profiler: StartupProfiler | None = None,
 ) -> None:
@@ -3995,6 +4003,8 @@ def _run_with_local_server(
     :param claude_args: Claude CLI args.
     :param command: Executable to run in the terminal resource.
     :param claude_config: Optional ucode-derived Claude Code config.
+    :param model: Optional configured default model to persist on the
+        Omnigent session as ``model_override``.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL after the session is prepared.
     :param startup_profiler: Optional startup profiler for timing
@@ -4072,6 +4082,7 @@ def _run_with_local_server(
                     claude_args=claude_args,
                     command=command,
                     claude_config=claude_config,
+                    model=model,
                     startup_profiler=startup_profiler,
                     startup_progress=progress,
                     append_system_prompt=_wrapper_spec_startup_instructions(spec_path),
@@ -4925,6 +4936,7 @@ async def _prepare_claude_terminal_via_daemon(
     claude_args: tuple[str, ...],
     host_id: str,
     workspace: str,
+    model: str | None = None,
     startup_profiler: StartupProfiler | None = None,
     startup_progress: RunnerStartupProgress | None = None,
 ) -> PreparedClaudeTerminal:
@@ -4952,6 +4964,8 @@ async def _prepare_claude_terminal_via_daemon(
         session's ``terminal_launch_args`` so the runner launches with
         them. On resume, non-empty args replace the stored set
         (last-write-wins); empty reuses the stored set.
+    :param model: Optional configured default model to persist on the
+        Omnigent session as ``model_override``.
     :param host_id: This machine's host id, e.g. ``"host_abc123"``.
     :param workspace: Absolute host path for the runner cwd, e.g.
         ``"/Users/me/proj"``.
@@ -4999,12 +5013,17 @@ async def _prepare_claude_terminal_via_daemon(
                 ),
                 wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
+            if model is not None:
+                await client.patch(
+                    f"/v1/sessions/{url_component(session_id)}",
+                    json={"model_override": model},
+                )
             _mark_startup_step(
                 startup_profiler,
                 "daemon claude session created and host online",
                 startup_progress=startup_progress,
             )
-        elif persist_args:
+        elif persist_args or model is not None:
             # Resume with new flags: replace the stored args
             # (last-write-wins). No new flags → leave the stored set so
             # the runner reuses them.
@@ -5014,9 +5033,14 @@ async def _prepare_claude_terminal_via_daemon(
                 startup_progress=startup_progress,
                 progress_message="Updating Claude session...",
             )
+            patch: dict[str, object] = {}
+            if persist_args:
+                patch["terminal_launch_args"] = persist_args
+            if model is not None:
+                patch["model_override"] = model
             await client.patch(
                 f"/v1/sessions/{url_component(session_id)}",
-                json={"terminal_launch_args": persist_args},
+                json=patch,
             )
             _mark_startup_step(
                 startup_profiler,
@@ -5161,6 +5185,7 @@ def _run_with_remote_server(
     session_id: str | None,
     resume_picker: bool,
     claude_args: tuple[str, ...],
+    model: str | None = None,
     prompt: str | None = None,
     auto_open_conversation: bool = False,
     startup_profiler: StartupProfiler | None = None,
@@ -5188,6 +5213,8 @@ def _run_with_remote_server(
         launches ``claude`` itself and derives the ucode config from the
         provider config, so this path takes neither a ``command`` nor a
         ``claude_config``.)
+    :param model: Optional configured default model to persist on the
+        Omnigent session as ``model_override``.
     :param prompt: Optional message to submit once after preparation,
         outside terminal attach/reconnect attempts.
     :param auto_open_conversation: When ``True``, open the browser
@@ -5287,6 +5314,7 @@ def _run_with_remote_server(
                         claude_args=claude_args,
                         host_id=host_id,
                         workspace=str(Path.cwd().resolve()),
+                        model=model,
                         startup_profiler=startup_profiler,
                         startup_progress=progress,
                     )
@@ -5400,6 +5428,7 @@ async def _prepare_claude_terminal(
     claude_args: tuple[str, ...],
     command: str,
     claude_config: ClaudeNativeUcodeConfig | None = None,
+    model: str | None = None,
     startup_profiler: StartupProfiler | None = None,
     startup_progress: RunnerStartupProgress | None = None,
     append_system_prompt: str | None = None,
@@ -5416,6 +5445,8 @@ async def _prepare_claude_terminal(
     :param claude_args: Claude CLI args.
     :param command: Executable to run in the terminal resource.
     :param claude_config: Optional ucode-derived Claude Code config.
+    :param model: Optional configured default model to persist on the
+        Omnigent session as ``model_override``.
     :param startup_profiler: Optional startup profiler for timing
         marks. ``None`` disables output.
     :param startup_progress: Optional user-visible progress renderer,
@@ -5463,6 +5494,11 @@ async def _prepare_claude_terminal(
                 bridge_id=bridge_id,
                 claude_args=claude_args,
             )
+            if model is not None:
+                await client.patch(
+                    f"/v1/sessions/{url_component(session_id)}",
+                    json={"model_override": model},
+                )
             _mark_startup_step(
                 startup_profiler,
                 "claude session created",
@@ -7221,10 +7257,19 @@ def _merge_default_model_arg(
     """
     if not model:
         return claude_args
-    for arg in claude_args:
-        if arg == "--model" or arg.startswith("--model="):
-            return claude_args
+    if _claude_args_have_model(claude_args):
+        return claude_args
     return (*claude_args, "--model", model)
+
+
+def _claude_args_have_model(claude_args: tuple[str, ...]) -> bool:
+    """
+    Return whether explicit Claude CLI args already select a model.
+
+    :param claude_args: User-provided Claude Code args.
+    :returns: ``True`` when ``--model`` or ``--model=...`` is present.
+    """
+    return any(arg == "--model" or arg.startswith("--model=") for arg in claude_args)
 
 
 async def attach_local_terminal(

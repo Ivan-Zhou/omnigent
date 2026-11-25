@@ -572,6 +572,38 @@ def test_response_keeps_tool_calls_and_results_adjacent(
     assert [r["id"] for r in records] == [r["id"] for r in again]
 
 
+def test_parallel_tool_call_message_stops_for_results() -> None:
+    """A merged assistant message with unanswered calls reports ``toolUse``."""
+    items = [
+        _user_item("Inspect both files."),
+        _function_call_item(
+            name="read", call_id="c1", arguments='{"path":"a"}', item_id="fc1"
+        ),
+        _function_call_item(
+            name="read", call_id="c2", arguments='{"path":"b"}', item_id="fc2"
+        ),
+        _function_output_item(call_id="c2", output="second file", item_id="fo2"),
+        _function_output_item(call_id="c1", output="first file", item_id="fo1"),
+        _assistant_item("Both files inspected.", item_id="a2", response_id="r2"),
+    ]
+    records = pi_session_records_from_session_items(
+        items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
+    )
+    messages = [record["message"] for record in records[1:]]
+    assert [m["role"] for m in messages] == [
+        "user",
+        "assistant",
+        "toolResult",
+        "toolResult",
+        "assistant",
+    ]
+    assert [b["id"] for b in messages[1]["content"] if b["type"] == "toolCall"] == ["c1", "c2"]
+    # The batch is not answered until its results replay; ``stop`` would mark
+    # the turn complete and let Pi invent results before the real ones.
+    assert messages[1]["stopReason"] == "toolUse"
+    assert messages[-1]["stopReason"] == "stop"
+
+
 @pytest.mark.parametrize("response_ids", [("r1", "r2"), ("", ""), (None, None)])
 def test_distinct_or_missing_response_ids_stay_separate(response_ids: tuple) -> None:
     items = [_assistant_item("first"), _assistant_item("second", item_id="a2")]

@@ -177,6 +177,46 @@ def test_host_daemon_env_preserves_proxy_vars_and_provider_secret_split(
     )
 
 
+def test_remote_host_daemon_preserves_configured_provider_env_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured env credential crosses both remote process boundaries."""
+    # Given
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "configured-provider-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "unconfigured-provider-secret")
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config._load_config",
+        lambda: {
+            "providers": {
+                "anthropic": {
+                    "kind": "key",
+                    "anthropic": {
+                        "api_key_ref": "env:ANTHROPIC_API_KEY",
+                        "base_url": "https://api.anthropic.com",
+                    },
+                }
+            }
+        },
+    )
+
+    # When
+    daemon_env = _build_host_daemon_env(server_url=_REMOTE_SERVER_URL)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_anthropic",
+        binding_token="binding-anthropic",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    # Then
+    assert daemon_env["ANTHROPIC_API_KEY"] == "configured-provider-secret"
+    assert runner_env["ANTHROPIC_API_KEY"] == "configured-provider-secret"
+    assert "OPENAI_API_KEY" not in daemon_env
+    assert "OPENAI_API_KEY" not in runner_env
+
+
 def test_runner_env_excludes_proxy_vars_by_default() -> None:
     """Daemon proxy credentials do not cross into runner subprocesses by default."""
     # Given

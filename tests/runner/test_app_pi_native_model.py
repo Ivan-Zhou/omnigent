@@ -137,6 +137,8 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     monkeypatch.setattr(
         "omnigent.harnesses.pi_native.main.resolve_pi_executable", lambda: "/usr/bin/pi"
     )
+    monkeypatch.setattr(creds, "pi_native_self_provisioned", lambda: False)
+    monkeypatch.setattr(creds, "pi_native_databricks_env", dict)
 
     # ``resolve_pi_native_provider``'s default config_loader is bound at def
     # time, so inject the test config by patching the module symbol the runner
@@ -285,6 +287,8 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
     monkeypatch.setattr(
         "omnigent.harnesses.pi_native.main.resolve_pi_executable", lambda: "/usr/bin/pi"
     )
+    monkeypatch.setattr(creds, "pi_native_self_provisioned", lambda: False)
+    monkeypatch.setattr(creds, "pi_native_databricks_env", dict)
 
     real_resolve = creds.resolve_pi_native_provider
     captured: dict[str, Any] = {}
@@ -506,6 +510,10 @@ async def test_auto_create_pi_terminal_cold_resume_keeps_persisted_pi_login_pick
     workspace.mkdir()
     own_login_dir = tmp_path / "pi-own-login"
     seed_pi_own_login_catalog(own_login_dir, "openai-codex", ["gpt-5.6-sol"])
+    # Isolate the ambient omnigent config: a machine configured with a
+    # self-provisioning ``pi`` wrapper (``pi_native.self_provisioned``) would
+    # otherwise gate the provider/model injection off and drop the pick.
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
     monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(own_login_dir))
     monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))

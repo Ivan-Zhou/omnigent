@@ -2915,6 +2915,8 @@ async def _auto_create_pi_terminal(
     from omnigent.harnesses.pi_native.credentials import (
         PI_CODING_AGENT_DIR_ENV_VAR,
         global_pi_agent_dir,
+        pi_native_databricks_env,
+        pi_native_self_provisioned,
     )
     from omnigent.harnesses.pi_native.main import resolve_pi_executable
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -3037,10 +3039,11 @@ async def _auto_create_pi_terminal(
     # ``omnigent setup`` (Databricks gateway / API key), so a separate
     # ``pi /login`` isn't required — the parity codex-native/claude-native
     # already have. Skipped when the user pinned their own provider/model via
-    # terminal_launch_args. When no usable provider is configured Pi falls
-    # back to its own login, but a spec/session-pinned model still passes
-    # through as ``--model``. Session model configuration stays separate;
-    # supported user resources are linked into the session agent directory.
+    # terminal_launch_args or configured a self-provisioning Pi wrapper. When
+    # no usable provider is configured Pi falls back to its own login, but a
+    # spec/session-pinned model still passes through as ``--model``. Session
+    # model configuration stays separate; supported user resources are linked
+    # into the session agent directory.
     credential_warning: str | None = None
     effort_notice: str | None = None
     model_notice: str | None = None
@@ -3052,7 +3055,9 @@ async def _auto_create_pi_terminal(
             "This session has a configured Pi provider. Select its model in the composer "
             "and remove --provider, --model, and --api-key from terminal arguments."
         )
-    if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
+    if not pi_native_self_provisioned() and not _pi_args_have_provider(
+        launch_config.terminal_launch_args or []
+    ):
         from omnigent.harnesses.pi_native.credentials import (
             pi_native_provider_launch,
             pi_own_login_model_arg,
@@ -3100,6 +3105,10 @@ async def _auto_create_pi_terminal(
             own_login_model = pi_own_login_model_arg(spec_model)
             if own_login_model is not None:
                 provider_args.extend(["--model", own_login_model])
+
+    # Some custom Pi wrappers require workspace credentials before their RPC
+    # loop starts. Vanilla Pi ignores these variables.
+    pi_env.update(pi_native_databricks_env())
     agent_dir = Path(pi_env.get(PI_CODING_AGENT_DIR_ENV_VAR) or global_pi_agent_dir()).expanduser()
     if not agent_dir.is_absolute():
         agent_dir = launch_config.workspace / agent_dir

@@ -29,7 +29,7 @@ from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypeAlias, TypedDict, TypeGuard
+from typing import TYPE_CHECKING, Any, NamedTuple, NotRequired, TypeAlias, TypedDict, TypeGuard
 from urllib.parse import urlparse
 
 from omnigent._platform import default_shell_argv
@@ -1895,6 +1895,63 @@ def resolve_pi_native_provider(
             exc_info=True,
         )
         return None
+
+
+def _pi_native_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the optional configuration for a custom Pi wrapper."""
+    block = config.get("pi_native")
+    return block if isinstance(block, dict) else {}
+
+
+def pi_native_self_provisioned(
+    *,
+    config_loader: Callable[[], dict[str, Any]] = load_config,
+) -> bool:
+    """Return whether the configured Pi wrapper owns provider selection."""
+    try:
+        return bool(_pi_native_config(config_loader()).get("self_provisioned", False))
+    except Exception:  # noqa: BLE001 - configuration failure must not block launch
+        return False
+
+
+def pi_native_databricks_env(
+    *,
+    config_loader: Callable[[], dict[str, Any]] = load_config,
+) -> dict[str, str]:
+    """Resolve the Databricks environment required by a custom Pi wrapper."""
+    try:
+        config = config_loader()
+        configured = _pi_native_config(config).get("databricks_profile")
+        profile: str | None = configured if isinstance(configured, str) else None
+        if profile is None:
+            entry = default_provider_for_harness(config, PI_SURFACE)
+            if entry is not None and entry.kind == DATABRICKS_KIND:
+                profile = entry.profile
+            else:
+                providers = config.get("providers") or {}
+                if isinstance(providers, dict):
+                    for raw in providers.values():
+                        if isinstance(raw, dict) and raw.get("kind") == DATABRICKS_KIND:
+                            candidate = raw.get("profile")
+                            profile = candidate if isinstance(candidate, str) else None
+                            break
+
+        if profile is None:
+            return {}
+
+        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
+
+        creds = resolve_databricks_workspace(profile)
+        if not creds.host or not creds.token:
+            return {}
+        return {"DATABRICKS_HOST": creds.host, "DATABRICKS_TOKEN": creds.token}
+    except Exception:
+        # Credential failure must not block launch.
+        _LOGGER.info(
+            "pi-native: could not resolve Databricks environment for the Pi terminal",
+            exc_info=True,
+        )
+        return {}
 
 
 def write_pi_models_config(

@@ -403,3 +403,10 @@ def test_dispatch_cleanup_reports_foreign_creator_without_claiming_deletion() ->
 
 def test_dispatch_cleanup_has_a_separate_concurrency_group() -> None:
     assert "format('cleanup-{0}', inputs.pr_number)" in WORKFLOW
+
+
+def test_secret_bearing_jobs_only_run_in_canonical_repository() -> None:
+    jobs = yaml.safe_load(WORKFLOW)["jobs"]
+    for job_name in ("deploy", "cleanup"):
+        condition = jobs[job_name].get("if", "")
+        assert "github.repository == 'omnigent-ai/omnigent'" in condition

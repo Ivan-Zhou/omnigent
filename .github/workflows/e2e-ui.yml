@@ -137,14 +137,14 @@ jobs:
       # is a pure function of sidecar/** + the toolchain. Cache the built binary
       # (not the 1.6 GB target dir) and skip the ~7 min compile below on a hit;
       # the key self-invalidates when the source, Cargo.lock, or rustc changes.
-      # Same key as ci.yml's codex-parity job -- ci.yml runs on push to main and
-      # populates the main-scoped cache that this PR-only workflow restores from.
+      # Include the runner image: binaries built on newer glibc cannot run
+      # on the Ubuntu version used by the browser-test shards.
       - name: Cache parity sidecar binary
         id: sidecar-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .tmp-codex-parity-target/debug/codex-parity-sidecar
-          key: codex-parity-bin-locked-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
+          key: codex-parity-bin-ubuntu-24.04-${{ runner.arch }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
       - name: Build parity sidecar
         if: steps.sidecar-cache.outputs.cache-hit != 'true'
         run: |
@@ -306,7 +306,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .venv
-          key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}-${{ hashFiles('uv.toml') }}
+          key: venv-ubuntu-24.04-${{ runner.arch }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}-${{ hashFiles('uv.toml') }}
       - name: Install project + test dependencies
         run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
 
@@ -340,9 +340,9 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('uv.lock') }}
+          key: ubuntu-24.04-${{ runner.arch }}-playwright-${{ hashFiles('uv.lock') }}
           restore-keys: |
-            ${{ runner.os }}-playwright-
+            ubuntu-24.04-${{ runner.arch }}-playwright-
 
       - name: Install Playwright Chromium
         run: |

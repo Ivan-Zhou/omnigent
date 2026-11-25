@@ -4091,6 +4091,104 @@ def test_connect_broker_skipped_without_sidecar(monkeypatch: pytest.MonkeyPatch)
     assert creds.resolve_pi_native_provider(config_loader=lambda: {"providers": {}}) is None
 
 
+def _patch_workspace(
+    monkeypatch: pytest.MonkeyPatch, *, host: str, token: str
+) -> list[str | None]:
+    """Stub workspace resolution and capture the selected profile."""
+    from omnigent.runtime.credentials import databricks as db_creds_mod
+
+    seen: list[str | None] = []
+
+    def _fake(profile: str | None) -> object:
+        seen.append(profile)
+        return db_creds_mod.WorkspaceCreds(host=host, token=token)
+
+    monkeypatch.setattr(db_creds_mod, "resolve_databricks_workspace", _fake)
+    return seen
+
+
+def test_databricks_env_resolves_from_default_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = _patch_workspace(monkeypatch, host="https://wkspc.example.com", token="tok")
+
+    env = creds.pi_native_databricks_env(config_loader=_databricks_config)
+
+    assert env == {
+        "DATABRICKS_HOST": "https://wkspc.example.com",
+        "DATABRICKS_TOKEN": "tok",
+    }
+    assert seen == ["demo-staging"]
+
+
+def test_databricks_env_falls_back_to_non_default_databricks_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = {
+        "providers": {
+            "claude": {"kind": "subscription", "default": True, "cli": "claude"},
+            "databricks": {"kind": "databricks", "profile": "sibling-workspace"},
+        }
+    }
+    seen = _patch_workspace(monkeypatch, host="https://wkspc.example.com", token="tok")
+
+    env = creds.pi_native_databricks_env(config_loader=lambda: config)
+
+    assert env["DATABRICKS_HOST"] == "https://wkspc.example.com"
+    assert env["DATABRICKS_TOKEN"] == "tok"
+    assert seen == ["sibling-workspace"]
+
+
+def test_databricks_env_empty_when_creds_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_workspace(monkeypatch, host="", token="")
+
+    assert creds.pi_native_databricks_env(config_loader=_databricks_config) == {}
+
+
+def test_databricks_env_empty_without_databricks_provider() -> None:
+    config = {
+        "providers": {
+            "anthropic": {
+                "kind": "key",
+                "default": True,
+                "anthropic": {"base_url": "https://api.anthropic.com", "api_key": "sk-x"},
+            }
+        }
+    }
+    assert creds.pi_native_databricks_env(config_loader=lambda: config) == {}
+
+
+def test_self_provisioned_true_when_configured() -> None:
+    config = {"pi_native": {"self_provisioned": True}}
+    assert creds.pi_native_self_provisioned(config_loader=lambda: config) is True
+
+
+def test_self_provisioned_defaults_false() -> None:
+    assert creds.pi_native_self_provisioned(config_loader=dict) is False
+    assert creds.pi_native_self_provisioned(config_loader=lambda: {"pi_native": {}}) is False
+
+
+def test_self_provisioned_false_on_malformed_block() -> None:
+    assert creds.pi_native_self_provisioned(config_loader=lambda: {"pi_native": "nope"}) is False
+
+
+def test_databricks_env_prefers_configured_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = {
+        "pi_native": {"self_provisioned": True, "databricks_profile": "alt-workspace"},
+        "providers": {
+            "databricks": {
+                "kind": "databricks",
+                "default": True,
+                "profile": "default-workspace",
+            },
+        },
+    }
+    seen = _patch_workspace(monkeypatch, host="https://alt.example.com", token="tok")
+
+    env = creds.pi_native_databricks_env(config_loader=lambda: config)
+
+    assert env["DATABRICKS_HOST"] == "https://alt.example.com"
+    assert seen == ["alt-workspace"]
+
+
 def test_inline_family_registers_curated_shortlist_as_extra_models() -> None:
     """The family's ``models:`` tier map registers as Pi ``extra_models``.
 

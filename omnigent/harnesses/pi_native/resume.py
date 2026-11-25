@@ -680,7 +680,11 @@ def _pi_assistant_message(
                 "total": 0,
             },
         },
-        "stopReason": "stop",
+        # A message whose calls are not yet answered stopped to wait for its
+        # tool results; ``stop`` would tell Pi the turn already completed.
+        "stopReason": "toolUse"
+        if any(block.get("type") == "toolCall" for block in content)
+        else "stop",
         "timestamp": 0,
     }
 

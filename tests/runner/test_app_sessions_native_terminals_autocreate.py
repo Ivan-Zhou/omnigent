@@ -168,6 +168,15 @@ class _ResumeSnapshotServerClient(NullServerClient):
         return _Response()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_pi_native_customization(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep native-terminal tests independent of the user's Pi configuration."""
+    import omnigent.harnesses.pi_native.credentials as pi_native_credentials
+
+    monkeypatch.setattr(pi_native_credentials, "pi_native_self_provisioned", lambda: False)
+    monkeypatch.setattr(pi_native_credentials, "pi_native_databricks_env", dict)
+
+
 def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
     settings_path = Path(args[args.index("--settings") + 1])
     return json.loads(settings_path.read_text(encoding="utf-8"))
@@ -450,7 +459,6 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
     monkeypatch.setenv("SYNTH_EXCLUDED", "sentinel-excluded")
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
     monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
-
     provider = pi_native_credentials.PiProviderConfig(
         provider_id="omnigent",
         base_url="https://wkspc.example.com/ai-gateway/anthropic",
