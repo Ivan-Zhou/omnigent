@@ -24,7 +24,7 @@ import importlib.util
 import json
 import math
 from collections.abc import Iterator
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from os import PathLike
 from typing import Any, NoReturn
@@ -104,6 +104,10 @@ CAP_WORKSPACE_API = "workspace_api"
 # The host's runners accept session messages up to ``SESSION_MESSAGE_MAX_CHARS``
 # (32,000) instead of 8,000, so automations can send long instructions:
 CAP_LONG_SESSION_MESSAGES = "long_session_messages"
+# DATABRICKS-PATCH(smart-routing): the host answers ``host.smart_routing_eligibility``:
+CAP_SMART_ROUTING_ELIGIBILITY = "smart_routing_eligibility"
+# DATABRICKS-PATCH(smart-routing): the host answers ``host.smart_routing_feedback``:
+CAP_SMART_ROUTING_FEEDBACK = "smart_routing_feedback"
 # The host's runners ship the ``import-memory`` framework skill, so the server may
 # list it; an older runner cannot load its content:
 CAP_MEMORY_IMPORT_SKILL = "memory_import_skill"
@@ -130,6 +134,8 @@ HOST_CAPABILITIES: list[str] = [
     CAP_HARNESS_LOGIN,
     CAP_CLONE_REPOSITORY,
     CAP_LONG_SESSION_MESSAGES,
+    CAP_SMART_ROUTING_ELIGIBILITY,  # DATABRICKS-PATCH(smart-routing)
+    CAP_SMART_ROUTING_FEEDBACK,  # DATABRICKS-PATCH(smart-routing)
     CAP_MEMORY_IMPORT_SKILL,
 ]
 # The workspace API needs the optional `omnigent[workspace-api]` extra.
@@ -302,6 +308,11 @@ class HostFrameKind(str, Enum):
     MCP_TOOLS_RESULT = "host.mcp_tools_result"
     HARNESS_STARTUP = "host.harness_startup"
     HARNESS_STARTUP_RESULT = "host.harness_startup_result"
+    # DATABRICKS-PATCH(smart-routing)
+    SMART_ROUTING_ELIGIBILITY = "host.smart_routing_eligibility"
+    SMART_ROUTING_ELIGIBILITY_RESULT = "host.smart_routing_eligibility_result"
+    SMART_ROUTING_FEEDBACK = "host.smart_routing_feedback"
+    SMART_ROUTING_FEEDBACK_RESULT = "host.smart_routing_feedback_result"
     MCP_SERVERS = "host.mcp_servers"
     MCP_SERVERS_RESULT = "host.mcp_servers_result"
     IMPORT_LOCAL = "host.import_local"
@@ -1446,6 +1457,66 @@ class HostHarnessStartupResultFrame:
     startup: HarnessStartup | None = None
 
 
+# DATABRICKS-PATCH(smart-routing)
+@dataclass
+class HostSmartRoutingEligibilityFrame:
+    """Server → host: is this harness eligible for the Web UI's Smart Routing switch?"""
+
+    request_id: str
+    harness: str
+
+
+# DATABRICKS-PATCH(smart-routing)
+@dataclass
+class HostSmartRoutingEligibilityResultFrame:
+    """Host → server: the eligibility bit only, never the config entry itself."""
+
+    request_id: str
+    eligible: bool
+
+
+# DATABRICKS-PATCH(smart-routing)
+@dataclass
+class SmartRoutingFeedbackSession:
+    """The Omnigent session a Smart Routing feedback is about."""
+
+    native_session_id: str
+    # ``"on"``, ``"off"`` or ``"disable"``, or ``None`` for a session created without the switch.
+    smart_routing_state: str | None
+    # A Codex session's bridge id, whose private CODEX_HOME holds the thread; ``None`` otherwise.
+    codex_bridge_id: str | None = None
+
+
+# DATABRICKS-PATCH(smart-routing)
+@dataclass
+class HostSmartRoutingFeedbackFrame:
+    """Server → host: save this Smart Routing feedback with the host's configured command."""
+
+    request_id: str
+    harness: str
+    feedback_id: str
+    message: str
+    trigger: str
+    # ``None`` on the start page, which has no session yet.
+    session: SmartRoutingFeedbackSession | None
+
+
+# DATABRICKS-PATCH(smart-routing)
+@dataclass
+class HostSmartRoutingFeedbackResultFrame:
+    """Host → server: the feedback command's answer, or why there is none.
+
+    ``status`` is ``"saved"`` (with ``feedback_id``) or ``"feedback_off"``.
+    Otherwise ``error`` is ``"no_command"``, ``"failed"``, ``"bad_reply"`` or
+    ``"timeout"``; the command's own output never leaves the host.
+    """
+
+    request_id: str
+    feedback_id: str | None = None
+    status: str | None = None
+    error: str | None = None
+
+
 @dataclass
 class HostMcpServersFrame:
     """Server → host: list the user-level MCP servers each harness loads."""
@@ -1735,6 +1806,10 @@ HostFrame = (
     | HostMcpToolsResultFrame
     | HostHarnessStartupFrame
     | HostHarnessStartupResultFrame
+    | HostSmartRoutingEligibilityFrame  # DATABRICKS-PATCH(smart-routing)
+    | HostSmartRoutingEligibilityResultFrame  # DATABRICKS-PATCH(smart-routing)
+    | HostSmartRoutingFeedbackFrame  # DATABRICKS-PATCH(smart-routing)
+    | HostSmartRoutingFeedbackResultFrame  # DATABRICKS-PATCH(smart-routing)
     | HostMcpServersFrame
     | HostMcpServersResultFrame
     | HostImportLocalFrame
@@ -2457,6 +2532,45 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "startup": frame.startup.model_dump() if frame.startup is not None else None,
             }
         )
+    # DATABRICKS-PATCH(smart-routing)
+    if isinstance(frame, HostSmartRoutingEligibilityFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SMART_ROUTING_ELIGIBILITY.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+            }
+        )
+    if isinstance(frame, HostSmartRoutingEligibilityResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SMART_ROUTING_ELIGIBILITY_RESULT.value,
+                "request_id": frame.request_id,
+                "eligible": frame.eligible,
+            }
+        )
+    if isinstance(frame, HostSmartRoutingFeedbackFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SMART_ROUTING_FEEDBACK.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+                "feedback_id": frame.feedback_id,
+                "message": frame.message,
+                "trigger": frame.trigger,
+                "session": asdict(frame.session) if frame.session is not None else None,
+            }
+        )
+    if isinstance(frame, HostSmartRoutingFeedbackResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.SMART_ROUTING_FEEDBACK_RESULT.value,
+                "request_id": frame.request_id,
+                "feedback_id": frame.feedback_id,
+                "status": frame.status,
+                "error": frame.error,
+            }
+        )
     if isinstance(frame, HostMcpServersFrame):
         return _encode_payload(
             {"kind": HostFrameKind.MCP_SERVERS.value, "request_id": frame.request_id}
@@ -2948,6 +3062,19 @@ def _decode_known_host_frame(
                 # Keep correlation so malformed replies fail promptly instead of timing out.
                 startup = None
             return HostHarnessStartupResultFrame(request_id, startup)
+        # DATABRICKS-PATCH(smart-routing)
+        case HostFrameKind.SMART_ROUTING_ELIGIBILITY:
+            return HostSmartRoutingEligibilityFrame(
+                request_id=_required_str(msg, "request_id"), harness=_required_str(msg, "harness")
+            )
+        case HostFrameKind.SMART_ROUTING_ELIGIBILITY_RESULT:
+            return HostSmartRoutingEligibilityResultFrame(
+                request_id=_required_str(msg, "request_id"), eligible=msg.get("eligible") is True
+            )
+        case HostFrameKind.SMART_ROUTING_FEEDBACK:
+            return _decode_smart_routing_feedback(msg)
+        case HostFrameKind.SMART_ROUTING_FEEDBACK_RESULT:
+            return _decode_smart_routing_feedback_result(msg)
         case HostFrameKind.MCP_SERVERS:
             return HostMcpServersFrame(request_id=_required_str(msg, "request_id"))
         case HostFrameKind.MCP_SERVERS_RESULT:
@@ -3905,6 +4032,46 @@ def _decode_import_local_done(msg: _JsonObject) -> HostImportLocalDoneFrame:
         failed=raw_failed if isinstance(raw_failed := msg.get("failed"), int) else 0,
         failures=failures,
     )
+
+
+# DATABRICKS-PATCH(smart-routing)
+def _decode_smart_routing_feedback(msg: _JsonObject) -> HostSmartRoutingFeedbackFrame:
+    """Decode a host.smart_routing_feedback frame."""
+    session = msg.get("session")
+    if session is not None and not isinstance(session, dict):
+        raise ValueError("frame field must be an object or null: 'session'")
+    return HostSmartRoutingFeedbackFrame(
+        request_id=_required_str(msg, "request_id"),
+        harness=_required_str(msg, "harness"),
+        feedback_id=_required_str(msg, "feedback_id"),
+        message=_required_str(msg, "message"),
+        trigger=_required_str(msg, "trigger"),
+        session=(
+            None
+            if session is None
+            else SmartRoutingFeedbackSession(
+                native_session_id=_required_str(session, "native_session_id"),
+                smart_routing_state=_optional_nullable_str(session, "smart_routing_state"),
+                codex_bridge_id=_optional_nullable_str(session, "codex_bridge_id"),
+            )
+        ),
+    )
+
+
+# DATABRICKS-PATCH(smart-routing)
+def _decode_smart_routing_feedback_result(msg: _JsonObject) -> HostSmartRoutingFeedbackResultFrame:
+    """Decode a host.smart_routing_feedback_result frame."""
+    request_id = _required_str(msg, "request_id")
+    try:
+        return HostSmartRoutingFeedbackResultFrame(
+            request_id,
+            feedback_id=_optional_nullable_str(msg, "feedback_id"),
+            status=_optional_nullable_str(msg, "status"),
+            error=_optional_nullable_str(msg, "error"),
+        )
+    except ValueError:
+        # Keep correlation so malformed replies fail promptly instead of timing out.
+        return HostSmartRoutingFeedbackResultFrame(request_id, error="bad_reply")
 
 
 # ── Field validators ─────────────────────────────────────

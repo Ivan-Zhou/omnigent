@@ -136,6 +136,9 @@ from omnigent.host.frames import (
     HostSkillContentResultFrame,
     HostSkillsFrame,
     HostSkillsResultFrame,
+    HostSmartRoutingEligibilityFrame,  # DATABRICKS-PATCH(smart-routing)
+    HostSmartRoutingEligibilityResultFrame,  # DATABRICKS-PATCH(smart-routing)
+    HostSmartRoutingFeedbackFrame,  # DATABRICKS-PATCH(smart-routing)
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -162,6 +165,12 @@ from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.host.session_env import consume_session_env_handoff
+from omnigent.host.smart_routing_entry import (
+    is_smart_routing_eligible,  # DATABRICKS-PATCH(smart-routing)
+)
+from omnigent.host.smart_routing_feedback import (
+    run_smart_routing_feedback,  # DATABRICKS-PATCH(smart-routing)
+)
 from omnigent.inner import _proc
 from omnigent.onboarding.harness_accounts import (
     HARNESS_ACCOUNT_KEYS,
@@ -4181,6 +4190,14 @@ class HostProcess:
             _logger.exception("Harness launch settings failed")
             return HostHarnessStartupResultFrame(frame.request_id)
 
+    def _handle_smart_routing_eligibility(
+        self, frame: HostSmartRoutingEligibilityFrame
+    ) -> HostSmartRoutingEligibilityResultFrame:
+        """DATABRICKS-PATCH(smart-routing): answer from the user-level config file."""
+        return HostSmartRoutingEligibilityResultFrame(
+            frame.request_id, is_smart_routing_eligible(frame.harness)
+        )
+
     def _handle_mcp_servers(self, frame: HostMcpServersFrame) -> HostMcpServersResultFrame:
         """List user-level MCP servers in a worker thread."""
         try:
@@ -6374,6 +6391,17 @@ class HostProcess:
         elif isinstance(frame, HostHarnessStartupFrame):
             startup_result = await asyncio.to_thread(self._handle_harness_startup, frame)
             await self._send_text(ws, self._encode_frame(startup_result))
+        # DATABRICKS-PATCH(smart-routing)
+        elif isinstance(frame, HostSmartRoutingEligibilityFrame):
+            eligibility_result = await asyncio.to_thread(
+                self._handle_smart_routing_eligibility, frame
+            )
+            await self._send_text(ws, self._encode_frame(eligibility_result))
+        # DATABRICKS-PATCH(smart-routing)
+        elif isinstance(frame, HostSmartRoutingFeedbackFrame):
+            with self._host_subprocess_op():
+                feedback_result = await run_smart_routing_feedback(frame)
+            await self._send_text(ws, self._encode_frame(feedback_result))
         elif isinstance(frame, HostMcpServersFrame):
             mcp_result = await asyncio.to_thread(self._handle_mcp_servers, frame)
             await self._send_text(ws, self._encode_frame(mcp_result))
